@@ -24,17 +24,47 @@ pub fn tag(comptime s: *const [4]u8) u32 {
 /// Where a mark sits relative to the glyph it attaches to, in font units.
 pub const Offset = struct { x: i16 = 0, y: i16 = 0 };
 
-/// GDEF, only as much of it as matching needs: which glyphs are marks, so a
-/// lookup flagged IgnoreMarks can step over them instead of being blocked.
+/// GDEF, only as much of it as matching needs: which glyphs a lookup flagged
+/// IgnoreMarks or UseMarkFilteringSet may step over.
+///
+/// Three tables, and they answer three different questions, which is why the
+/// flags are not one flag:
+///
+/// - `GlyphClassDef` says whether a glyph is a mark at all. IgnoreMarks asks
+///   exactly this and nothing more.
+/// - `MarkAttachClassDef` says which mark CLASS a glyph belongs to. Attach-Type
+///   selects by class, and `IgnoreBaseGlyphs`/`IgnoreLigatures` ask whether a
+///   glyph is a base or a ligature, which is also GlyphClassDef.
+/// - `MarkGlyphSetsDef` (GDEF 1.2+) lists named sets of coverage tables.
+///   UseMarkFilteringSet names ONE set by index, and only glyphs inside it are
+///   transparent -- a mark outside the set still blocks the match.
+///
+/// Reading UseMarkFilteringSet as if it were IgnoreMarks (which is what this
+/// did before) is the difference between shaping and approximating: a font
+/// that filters to "combining marks below" would have had every above-mark
+/// skipped too, and a rule meant to span a specific mark would match across
+/// the wrong ones.
 pub const Gdef = struct {
     data: []const u8,
     class_def: usize = 0, // absolute offset, 0 when the table has none
+    attach_class: usize = 0,
+    sets_at: usize = 0,
 
     pub fn init(data: []const u8, off: u32, len: u32) Error!Gdef {
         if (data.len < off + len or len < 12) return error.Truncated;
+        const end: usize = off + @as(usize, len);
         var g: Gdef = .{ .data = data };
         const rel = try u16At(data, off + 4);
-        if (rel != 0) g.class_def = off + rel;
+        if (rel != 0) g.class_def = try relInside(off, end, rel);
+        const attach = try u16At(data, off + 10);
+        if (attach != 0) g.attach_class = try relInside(off, end, attach);
+        // Major/minor 1.2 introduced MarkGlyphSetsDef at offset 12, and the
+        // minor version is what decides whether that offset is there at all.
+        const minor = try u16At(data, off + 2);
+        if (minor >= 2 and len >= 14) {
+            const sets = try u16At(data, off + 12);
+            if (sets != 0) g.sets_at = try relInside(off, end, sets);
+        }
         return g;
     }
 
@@ -63,11 +93,152 @@ pub const Gdef = struct {
         }
     }
 
-    /// Class 3 is "mark" in GDEF's GlyphClassDef.
+    /// Class 1 is base, 2 is ligature, 3 is mark, 4 is component. Anything the
+    /// ClassDef does not mention is class 0, which is none of the four.
     pub fn isMark(self: Gdef, gid: u16) Error!bool {
         return (try self.classOf(gid)) == 3;
     }
+
+    pub fn isBase(self: Gdef, gid: u16) Error!bool {
+        return (try self.classOf(gid)) == 1;
+    }
+
+    pub fn isLigature(self: Gdef, gid: u16) Error!bool {
+        return (try self.classOf(gid)) == 2;
+    }
+
+    /// Mark attachment class, for Attach-Type. 0 means "not in any class",
+    /// which Attach-Type never matches, so a font may leave this table out.
+    pub fn attachClassOf(self: Gdef, gid: u16) Error!u16 {
+        if (self.attach_class == 0) return 0;
+        return classDefAt(self.data, self.attach_class, gid);
+    }
+
+    /// Is `gid` inside the MarkGlyphSetsDef set numbered `set`?
+    pub fn inMarkSet(self: Gdef, set: u16, gid: u16) Error!bool {
+        if (self.sets_at == 0) return false;
+        const at = self.sets_at;
+        const format = try u16At(self.data, at);
+        if (format != 1) return false;
+        const count = try u16At(self.data, at + 2);
+        if (set >= count) return false;
+        const rel = try u32At(self.data, at + 4 + @as(usize, set) * 4);
+        if (rel == 0) return false;
+        const cov = at + rel;
+        // Coverage returns an index, and reading it as a bool is the whole
+        // question here; the index itself is not used.
+        return (coverageIndexAt(self.data, cov, gid) catch null) != null;
+    }
+
+    /// A glyph is transparent to a lookup when the lookup's flag says so.
+    ///
+    /// The four flags are not exclusive and are evaluated in the order the
+    /// spec lists them; a glyph skipped by ANY of them is skipped. 0x0002 is
+    /// RESTRICTED TO SCRIPT SHAPERS, and nowhere near the mark question --
+    /// reading it as "also ignore marks" (which this did) widened every
+    /// IgnoreMarks lookup in a font that happened to set it.
+    pub fn skips(self: Gdef, flags: u16, set: u16, gid: u16) Error!bool {
+        // IgnoreBaseGlyphs asks the ClassDef; returning true unconditionally
+        // skipped every glyph in the buffer, which makes the lookup match
+        // nothing and is invisible in output because "nothing matched" is the
+        // same result as "no rule here".
+        if (flags & 0x0002 != 0 and try self.isBase(gid)) return true;
+        if (flags & 0x0004 != 0 and try self.isLigature(gid)) return true;
+        if (flags & 0x0008 != 0 and try self.isMark(gid)) return true;
+        if (flags & 0x0010 != 0 and try self.inMarkSet(set, gid)) return true;
+
+        // MarkAttachmentType: the HIGH BYTE of the flag names a mark class,
+        // and a glyph carrying a DIFFERENT class is skipped. A glyph with no
+        // class at all is not skipped by this bit -- it is filtered by
+        // UseMarkFilteringSet instead. Getting this backwards disables the
+        // filter without changing any output.
+        const want: u16 = (flags >> 8) & 0xFF;
+        if (want != 0) {
+            const have = try self.attachClassOf(gid);
+            if (have != 0 and have != want) return true;
+        }
+        return false;
+    }
 };
+
+/// ClassDef without the Layout indirection, so GDEF can use it too.
+fn classDefAt(data: []const u8, abs: usize, gid: u16) Error!u16 {
+    switch (try u16At(data, abs)) {
+        1 => {
+            const start = try u16At(data, abs + 2);
+            const n = try u16At(data, abs + 4);
+            if (gid < start or gid >= start + n) return 0;
+            return try u16At(data, abs + 6 + @as(usize, gid - start) * 2);
+        },
+        2 => {
+            const n = try u16At(data, abs + 2);
+            var lo: usize = 0;
+            var hi: usize = n;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                const r = abs + 4 + mid * 6;
+                const start = try u16At(data, r);
+                const last = try u16At(data, r + 2);
+                if (gid < start) {
+                    hi = mid;
+                } else if (gid > last) {
+                    lo = mid + 1;
+                } else {
+                    return try u16At(data, r + 4);
+                }
+            }
+            return 0;
+        },
+        else => return 0,
+    }
+}
+
+fn coverageIndexAt(data: []const u8, abs: usize, gid: u16) Error!?u16 {
+    const fmt = try u16At(data, abs);
+    const n = try u16At(data, abs + 2);
+    var lo: usize = 0;
+    var hi: usize = n;
+    switch (fmt) {
+        1 => {
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                const g = try u16At(data, abs + 4 + mid * 2);
+                if (g < gid) {
+                    lo = mid + 1;
+                } else if (g > gid) {
+                    hi = mid;
+                } else {
+                    return @intCast(mid);
+                }
+            }
+            return null;
+        },
+        2 => {
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                const r = abs + 4 + mid * 6;
+                const start = try u16At(data, r);
+                const last = try u16At(data, r + 2);
+                if (gid < start) {
+                    hi = mid;
+                } else if (gid > last) {
+                    lo = mid + 1;
+                } else {
+                    const first = try u16At(data, r + 4);
+                    return first + (gid - start);
+                }
+            }
+            return null;
+        },
+        else => return error.MissingTable,
+    }
+}
+
+fn relInside(base: usize, end: usize, rel: u16) Error!usize {
+    const abs = base + rel;
+    if (abs >= end) return error.Truncated;
+    return abs;
+}
 
 pub const Adjust = struct {
     x_placement: i16 = 0,
@@ -420,10 +591,11 @@ pub const Layout = struct {
             const kind = try u16At(self.data, lookup);
             const flags = try u16At(self.data, lookup + 2);
             const sub_count = try u16At(self.data, lookup + 4);
+            const mark_set = try self.markFilteringSet(li);
             var i: usize = 0;
             while (i < sub_count) : (i += 1) {
                 const sub = lookup + try u16At(self.data, lookup + 6 + i * 2);
-                const step = try self.substPass(kind, sub, out, len, flags);
+                const step = try self.substPass(kind, sub, out, len, flags, mark_set);
                 len = step;
             }
         }
@@ -454,6 +626,7 @@ pub const Layout = struct {
         const kind = try u16At(self.data, lookup);
         const flags = try u16At(self.data, lookup + 2);
         const sub_count = try u16At(self.data, lookup + 4);
+        const mark_set = try self.markFilteringSet(index);
         var cur = len;
         var i: usize = 0;
         while (i < sub_count) : (i += 1) {
@@ -464,7 +637,7 @@ pub const Layout = struct {
                 real_kind = try u16At(self.data, sub + 2);
                 real = sub + try u32At(self.data, sub + 4);
             }
-            const step = try self.substAt(real_kind, real, buf, cur, pos, depth, flags);
+            const step = try self.substAt(real_kind, real, buf, cur, pos, depth, flags, mark_set);
             // Only a HIT carries a length. Step.len defaults to 0 for a miss,
             // so assigning it unconditionally truncated the run to nothing at
             // the first lookup that did not match.
@@ -481,7 +654,137 @@ pub const Layout = struct {
     /// Formats 1 and 2 (glyph and class based rule sets) are not implemented
     /// and match nothing, so a font using them keeps its unsubstituted glyphs
     /// rather than producing wrong ones.
-    fn chainAt(self: Layout, sub: usize, buf: []u16, len: usize, pos: usize, depth: u4, flags: u16) Error!Step {
+    /// Contextual/chaining lookup dispatch by substFormat.
+    ///
+    /// Formats 1 and 2 differ from 3 only in how the input sequence is named --
+    /// a glyph-keyed ruleset, a class-keyed ruleset, or an explicit coverage
+    /// list. The records and the substitution loop are identical, so each
+    /// format earns its way to `runRecords` and nothing past that is
+    /// format-specific.
+    fn chainAt(self: Layout, sub: usize, buf: []u16, len: usize, pos: usize, depth: u4, flags: u16, set: u16) Error!Step {
+        const fmt = try u16At(self.data, sub);
+        return switch (fmt) {
+            1 => self.chainGlyphRules(sub, buf, len, pos, depth, flags, set),
+            2 => self.chainClassRules(sub, buf, len, pos, depth, flags, set),
+            3 => self.chainCoverage(sub, buf, len, pos, depth, flags, set),
+            else => .{},
+        };
+    }
+
+    /// Format 1: the first glyph of the input selects a RuleSet, and each Rule
+    /// in that set is a plain glyph sequence followed by records.
+    ///
+    /// Note the input coverage is a SET count, not a single coverage table:
+    /// offset 4 points at the first RuleSet, and a RuleSet appears at position
+    /// `coverageIndex(glyph)` in that array. An index past setCount means the
+    /// glyph has no rules, which is a miss and not an error.
+    fn chainGlyphRules(self: Layout, sub: usize, buf: []u16, len: usize, pos: usize, depth: u4, flags: u16, set: u16) Error!Step {
+        const cov = sub + try u16At(self.data, sub + 2);
+        const idx = (try self.coverageIndex(cov, buf[pos])) orelse return .{};
+        const set_n = try u16At(self.data, sub + 4);
+        if (idx >= set_n) return .{};
+        const set_rel = try u16At(self.data, sub + 6 + @as(usize, idx) * 2);
+        if (set_rel == 0) return .{}; // correct: this glyph simply has no rules
+        const set_at = sub + set_rel;
+        const rule_n = try u16At(self.data, set_at);
+        const st = try self.tryRules(set_at, rule_n, buf, len, pos, depth, flags, set);
+        return st;
+    }
+
+    /// Format 2: the input is a sequence of CLASSES, so every glyph must be
+    /// resolved through ClassDef before comparison, and the count of classes is
+    /// what the ClassSet array is indexed by.
+    fn chainClassRules(self: Layout, sub: usize, buf: []u16, len: usize, pos: usize, depth: u4, flags: u16, set: u16) Error!Step {
+        const cov = sub + try u16At(self.data, sub + 2);
+        const idx = (try self.coverageIndex(cov, buf[pos])) orelse return .{};
+        const class_def = sub + try u16At(self.data, sub + 4);
+        const class_n = try u16At(self.data, sub + 6);
+        if (idx >= class_n) return .{};
+        const set_rel = try u16At(self.data, sub + 8 + @as(usize, idx) * 2);
+        if (set_rel == 0) return .{};
+        const set_at = sub + set_rel;
+        const rule_n = try u16At(self.data, set_at);
+        return self.tryClassRules(class_def, set_at, rule_n, buf, len, pos, depth, flags, set);
+    }
+
+    /// Walk a RuleSet's rules for format 1, taking the first that matches.
+    ///
+    /// Longest-match would be wrong here: OpenType rule order IS priority, and
+    /// a face that lists a specific rule before a general one expects the
+    /// specific one to win. `chainClassRules` follows the same rule.
+    fn tryRules(self: Layout, set_at: usize, rule_n: usize, buf: []u16, len: usize, pos: usize, depth: u4, flags: u16, set: u16) Error!Step {
+        var r: usize = 0;
+        while (r < rule_n) : (r += 1) {
+            const rule = set_at + try u16At(self.data, set_at + 2 + r * 2);
+            const glyph_n = try u16At(self.data, rule);
+            const rec_n = try u16At(self.data, rule + 2);
+            if (glyph_n == 0 or glyph_n > 16) continue;
+
+            var positions: [16]usize = undefined;
+            var got: usize = 0;
+            var p = pos + 1; // the first glyph is what selected this rule
+            positions[0] = pos;
+            got = 1;
+            while (got < glyph_n) {
+                if (p >= len) return .{};
+                if (try self.skipsGlyph(flags, set, buf[p])) {
+                    p += 1;
+                    continue;
+                }
+                const want = try u16At(self.data, rule + 4 + (got - 1) * 2);
+                if (buf[p] != want) {
+                    got = 0;
+                    break;
+                }
+                positions[got] = p;
+                got += 1;
+                p += 1;
+            }
+            if (got != glyph_n) continue;
+            const rec_off = rule + 4 + (glyph_n - 1) * 2;
+            return self.runRecords(rec_off, rec_n, positions[0..glyph_n], pos, buf, len, depth);
+        }
+        return .{};
+    }
+
+    /// Walk a ClassSet's rules for format 2, comparing CLASSES rather than
+    /// glyph ids. Every glyph in the run is resolved through the ClassDef, so
+    /// two glyphs in the same class match the same rule.
+    fn tryClassRules(self: Layout, class_def: usize, set_at: usize, rule_n: usize, buf: []u16, len: usize, pos: usize, depth: u4, flags: u16, set: u16) Error!Step {
+        var r: usize = 0;
+        while (r < rule_n) : (r += 1) {
+            const rule = set_at + try u16At(self.data, set_at + 2 + r * 2);
+            const glyph_n = try u16At(self.data, rule);
+            const rec_n = try u16At(self.data, rule + 2);
+            if (glyph_n == 0 or glyph_n > 16) continue;
+
+            var positions: [16]usize = undefined;
+            positions[0] = pos;
+            var got: usize = 1;
+            var p = pos + 1;
+            while (got < glyph_n) {
+                if (p >= len) return .{};
+                if (try self.skipsGlyph(flags, set, buf[p])) {
+                    p += 1;
+                    continue;
+                }
+                const want = try u16At(self.data, rule + 4 + (got - 1) * 2);
+                if (try self.classOf(class_def, buf[p]) != want) {
+                    got = 0;
+                    break;
+                }
+                positions[got] = p;
+                got += 1;
+                p += 1;
+            }
+            if (got != glyph_n) continue;
+            const rec_off = rule + 4 + (glyph_n - 1) * 2;
+            return self.runRecords(rec_off, rec_n, positions[0..glyph_n], pos, buf, len, depth);
+        }
+        return .{};
+    }
+
+    fn chainCoverage(self: Layout, sub: usize, buf: []u16, len: usize, pos: usize, depth: u4, flags: u16, set: u16) Error!Step {
         if (try u16At(self.data, sub) != 3) return .{};
         var at = sub + 2;
 
@@ -512,19 +815,14 @@ pub const Layout = struct {
         // matched input slot back to its buffer index so the records below
         // still name the right glyph.
         if (in_n == 0 or in_n > 16) return .{};
-        const skip_marks = (flags & 0x0008 != 0) or (flags & 0x0010 != 0);
         var positions: [16]usize = undefined;
         var got: usize = 0;
         var p = pos;
         while (got < in_n) {
             if (p >= len) return .{};
-            if (skip_marks) {
-                if (self.gdef) |g| {
-                    if (try g.isMark(buf[p])) {
-                        p += 1;
-                        continue;
-                    }
-                }
+            if (try self.skipsGlyph(flags, set, buf[p])) {
+                p += 1;
+                continue;
             }
             const cov = sub + try u16At(self.data, in_off + got * 2);
             if ((try self.coverageIndex(cov, buf[p])) == null) return .{};
@@ -545,13 +843,9 @@ pub const Layout = struct {
         var adone: usize = 0;
         while (adone < ahead_n) {
             if (ap >= len) return .{};
-            if (skip_marks) {
-                if (self.gdef) |g| {
-                    if (try g.isMark(buf[ap])) {
-                        ap += 1;
-                        continue;
-                    }
-                }
+            if (try self.skipsGlyph(flags, set, buf[ap])) {
+                ap += 1;
+                continue;
             }
             const cov = sub + try u16At(self.data, ahead_off + adone * 2);
             if ((try self.coverageIndex(cov, buf[ap])) == null) return .{};
@@ -559,22 +853,7 @@ pub const Layout = struct {
             ap += 1;
         }
 
-        // Records name a position inside the input and a lookup to run there.
-        // A nested lookup may change the buffer length, so later target
-        // positions shift by however much the earlier ones moved.
-        var cur = len;
-        var shift: isize = 0;
-        for (0..rec_n) |r| {
-            const seq = try u16At(self.data, rec_off + r * 4);
-            const li = try u16At(self.data, rec_off + r * 4 + 2);
-            if (seq >= got) continue;
-            const target = @as(isize, @intCast(positions[seq])) + shift;
-            if (target < 0 or target >= @as(isize, @intCast(cur))) continue;
-            const before = cur;
-            cur = try self.applyLookupAt(li, buf, cur, @intCast(target), depth + 1);
-            shift += @as(isize, @intCast(cur)) - @as(isize, @intCast(before));
-        }
-        return .{ .hit = true, .len = cur, .advance = matched_end - pos };
+        return self.runRecords(rec_off, rec_n, positions[0..got], pos, buf, len, depth);
     }
 
     /// GPOS type 4, mark-to-base. Each mark glyph offsets itself by
@@ -880,6 +1159,7 @@ pub const Layout = struct {
             const kind = try u16At(self.data, lookup);
             const flags = try u16At(self.data, lookup + 2);
             const sub_count = try u16At(self.data, lookup + 4);
+            const mark_set = try self.markFilteringSet(li);
             // Subtables are ALTERNATIVES, not stages. At each position the
             // first subtable that matches is the one that applies -- even when
             // it records nothing. Running every subtable in turn let Amiri's
@@ -897,7 +1177,7 @@ pub const Layout = struct {
                         real_kind = try u16At(self.data, sub + 2);
                         real = sub + try u32At(self.data, sub + 4);
                     }
-                    const step = try self.substAt(real_kind, real, buf, cur, pos, 0, flags);
+                    const step = try self.substAt(real_kind, real, buf, cur, pos, 0, flags, mark_set);
                     if (step.hit) {
                         cur = step.len;
                         pos += step.advance;
@@ -912,7 +1192,7 @@ pub const Layout = struct {
     }
 
     /// Walk `buf[0..len]` applying one subtable at every position.
-    fn substPass(self: Layout, kind: u16, sub: usize, buf: []u16, len: usize, flags: u16) Error!usize {
+    fn substPass(self: Layout, kind: u16, sub: usize, buf: []u16, len: usize, flags: u16, mark_set: u16) Error!usize {
         var real_kind = kind;
         var real = sub;
         if (kind == 7) {
@@ -923,7 +1203,7 @@ pub const Layout = struct {
         var pos: usize = 0;
         var n = len;
         while (pos < n) {
-            const step = try self.substAt(real_kind, real, buf, n, pos, 0, flags);
+            const step = try self.substAt(real_kind, real, buf, n, pos, 0, flags, mark_set);
             if (step.hit) {
                 n = step.len;
                 pos += step.advance;
@@ -934,12 +1214,60 @@ pub const Layout = struct {
         return n;
     }
 
+    /// Apply a SequenceLookupRecord array at matched input positions.
+    ///
+    /// Shared by every contextual format because the record list is the same
+    /// structure in all of them; only how the input positions were established
+    /// differs. Format 3, and formats 1 and 2 of lookups 5 and 6, all funnel
+    /// their matches through here.
+    ///
+    /// A nested lookup may change the buffer length, so later target positions
+    /// shift by however much the earlier ones moved. `positions` maps each
+    /// matched input slot to its buffer index, so a record naming sequence
+    /// index i still lands on the glyph it was chosen for after an earlier
+    /// record lengthened or shortened the run.
+    fn runRecords(
+        self: Layout,
+        rec_off: usize,
+        rec_n: usize,
+        positions: []const usize,
+        pos: usize,
+        buf: []u16,
+        len: usize,
+        depth: u4,
+    ) Error!Step {
+        // Advance is a DISTANCE from pos, not the absolute index of the last
+        // matched glyph. Returning the absolute index scans correctly only
+        // when a match starts at 0, which is how this survived the format 3
+        // tests in this file and would have over-scanned in a real face.
+        const matched_end = if (positions.len == 0) 0 else positions[positions.len - 1] + 1;
+        const advance = if (matched_end > pos) matched_end - pos else 1;
+        var cur = len;
+        var shift: isize = 0;
+        var any: bool = false;
+        for (0..rec_n) |r| {
+            const seq = try u16At(self.data, rec_off + r * 4);
+            const li = try u16At(self.data, rec_off + r * 4 + 2);
+            if (seq >= positions.len) continue;
+            const target = @as(isize, @intCast(positions[seq])) + shift;
+            if (target < 0 or target >= @as(isize, @intCast(cur))) continue;
+            const before = cur;
+            cur = try self.applyLookupAt(li, buf, cur, @intCast(target), depth + 1);
+            shift += @as(isize, @intCast(cur)) - @as(isize, @intCast(before));
+            any = true;
+        }
+        // A record list where every record was out of range changed nothing.
+        // Reporting a hit would advance the scan past an untouched position.
+        if (!any and cur == len) return .{};
+        return .{ .hit = true, .len = cur, .advance = advance };
+    }
+
     const Step = struct { hit: bool = false, len: usize = 0, advance: usize = 1 };
 
-    fn substAt(self: Layout, kind: u16, sub: usize, buf: []u16, len: usize, pos: usize, depth: u4, flags: u16) Error!Step {
+    fn substAt(self: Layout, kind: u16, sub: usize, buf: []u16, len: usize, pos: usize, depth: u4, flags: u16, set: u16) Error!Step {
         // Contextual lookups gate other lookups rather than substituting a
         // glyph, so they do not have a coverage table at offset 2.
-        if (kind == 6) return self.chainAt(sub, buf, len, pos, depth, flags);
+        if (kind == 6) return self.chainAt(sub, buf, len, pos, depth, flags, set);
         const gid = buf[pos];
         const cov = sub + try u16At(self.data, sub + 2);
         const idx = (try self.coverageIndex(cov, gid)) orelse return .{};
@@ -977,11 +1305,11 @@ pub const Layout = struct {
             3 => {
                 const count = try u16At(self.data, sub + 4);
                 if (idx >= count) return .{};
-                const set = sub + try u16At(self.data, sub + 6 + @as(usize, idx) * 2);
-                const n = try u16At(self.data, set);
+                const lset = sub + try u16At(self.data, sub + 6 + @as(usize, idx) * 2);
+                const n = try u16At(self.data, lset);
                 if (n == 0) return .{};
                 // Alternate 0 is the designer's first choice.
-                const to = try u16At(self.data, set + 2);
+                const to = try u16At(self.data, lset + 2);
                 if (to == gid) return .{};
                 buf[pos] = to;
                 return .{ .hit = true, .len = len, .advance = 1 };
@@ -989,12 +1317,11 @@ pub const Layout = struct {
             4 => {
                 const count = try u16At(self.data, sub + 4);
                 if (idx >= count) return .{};
-                const set = sub + try u16At(self.data, sub + 6 + @as(usize, idx) * 2);
-                const lig_count = try u16At(self.data, set);
-                const skip_marks = (flags & 0x0008 != 0) or (flags & 0x0010 != 0);
+                const lset = sub + try u16At(self.data, sub + 6 + @as(usize, idx) * 2);
+                const lig_count = try u16At(self.data, lset);
                 var l: usize = 0;
                 while (l < lig_count) : (l += 1) {
-                    const lig = set + try u16At(self.data, set + 2 + l * 2);
+                    const lig = lset + try u16At(self.data, lset + 2 + l * 2);
                     const lig_glyph = try u16At(self.data, lig);
                     const comps = try u16At(self.data, lig + 2);
                     if (comps == 0 or comps > 16) continue;
@@ -1015,8 +1342,7 @@ pub const Layout = struct {
                             q += 1;
                             continue;
                         }
-                        const is_mark = if (self.gdef) |g| try g.isMark(buf[q]) else false;
-                        if (skip_marks and is_mark) {
+                        if (try self.skipsGlyph(flags, set, buf[q])) {
                             q += 1;
                             continue;
                         }
@@ -1065,6 +1391,31 @@ pub const Layout = struct {
             },
             else => return .{},
         }
+    }
+
+    /// Would lookup `flags` step over `gid`?
+    ///
+    /// A lookup with no flag bits set never skips anything and never touches
+    /// GDEF, which is the common case: most lookups carry flag 0.
+    fn skipsGlyph(self: Layout, flags: u16, set: u16, gid: u16) Error!bool {
+        if (flags & 0x001E == 0) return false;
+        const g = self.gdef orelse return false;
+        return g.skips(flags, set, gid);
+    }
+
+    /// The MarkFilteringSet a lookup names, or 0 when it names none.
+    ///
+    /// The set index is NOT in the Lookup header. It lives in the optional
+    /// tail that follows the SubTable offsets, and it is present only when
+    /// lookupFlag UseMarkFilteringSet (0x0010) is set. Reading offset 0x0010
+    /// of the lookup as if it were the set index silently picked up the first
+    /// subtable's offset instead.
+    pub fn markFilteringSet(self: Layout, index: u16) Error!u16 {
+        const lookup = self.lookup_list + try u16At(self.data, self.lookup_list + 2 + @as(usize, index) * 2);
+        const flags = try u16At(self.data, lookup + 2);
+        if (flags & 0x0010 == 0) return 0;
+        const sub_count = try u16At(self.data, lookup + 4);
+        return try u16At(self.data, lookup + 6 + @as(usize, sub_count) * 2);
     }
 
     /// Lookup type of a lookup index, with Extension wrappers resolved.
@@ -1161,6 +1512,9 @@ const Builder = struct {
     }
     fn patch16(b: *Builder, at: usize, v: usize) void {
         std.mem.writeInt(u16, b.buf[at..][0..2], @intCast(v), .big);
+    }
+    fn patch32(b: *Builder, at: usize, v: usize) void {
+        std.mem.writeInt(u32, b.buf[at..][0..4], @intCast(v), .big);
     }
 };
 
@@ -1861,4 +2215,340 @@ test "a chaining lookup whose lookahead fails changes nothing" {
     try testing.expectEqual(@as(usize, 2), n);
     try testing.expectEqual(@as(u16, 10), buf[0]);
     try testing.expectEqual(@as(u16, 30), buf[1]);
+}
+
+test "UseMarkFilteringSet skips only the named set, not every mark" {
+    // GDEF 1.2 with GlyphClassDef (50 = mark) and one MarkGlyphSet holding
+    // only glyph 30. A lookup flagged IgnoreMarks|UseMarkFilteringSet must
+    // step over 30 but be BLOCKED by 50 -- the two behave identically under
+    // the old proxy, which read UseMarkFilteringSet as "also ignore marks".
+    var gd = Builder.init();
+    _ = gd.put16(1); // majorVersion
+    _ = gd.put16(2); // minorVersion -> MarkGlyphSetsDef exists at +12
+    const gGlyphClass = gd.put16(0); // +4
+    _ = gd.put16(0); // +6 attachListOffset
+    _ = gd.put16(0); // +8 ligCaretListOffset
+    const gMarkAttach = gd.put16(0); // +10
+    const gSets = gd.put16(0); // +12
+
+    // GlyphClassDef format 1: glyph 50 is a mark.
+    const classAt = gd.len;
+    gd.patch16(gGlyphClass, classAt);
+    _ = gd.put16(1);
+    _ = gd.put16(50); // startGlyphID
+    _ = gd.put16(1); // glyphCount
+    _ = gd.put16(3); // class 3 = mark
+
+    const attachAt = gd.len;
+    gd.patch16(gMarkAttach, attachAt);
+    _ = gd.put16(1);
+    _ = gd.put16(50);
+    _ = gd.put16(1);
+    _ = gd.put16(2); // mark attach class 2
+
+    // MarkGlyphSets format 1: one set, covering glyph 30 only.
+    const setsAt = gd.len;
+    gd.patch16(gSets, setsAt);
+    _ = gd.put16(1); // format
+    _ = gd.put16(1); // setCount
+    const covRel = gd.put32(0);
+    const covAt = gd.len;
+    gd.patch32(covRel, covAt - setsAt);
+    _ = gd.put16(1); // coverage format 1
+    _ = gd.put16(1);
+    _ = gd.put16(30);
+
+    const g = try Gdef.init(gd.bytes(), 0, @intCast(gd.len));
+    try testing.expect(try g.isMark(50));
+    try testing.expect(!try g.isMark(30)); // in the SET, but not class 3
+    try testing.expect(try g.inMarkSet(0, 30));
+    try testing.expect(!try g.inMarkSet(0, 50));
+
+    // IgnoreMarks alone: 50 is skipped, 30 is not.
+    try testing.expect(try g.skips(0x0008, 0, 50));
+    try testing.expect(!try g.skips(0x0008, 0, 30));
+
+    // UseMarkFilteringSet: 30 is skipped, 50 (a mark OUTSIDE the set) is not.
+    try testing.expect(try g.skips(0x0010, 0, 30));
+    try testing.expect(!try g.skips(0x0010, 0, 50));
+
+    // The two together are the union, which is what the old code collapsed
+    // into "any mark is transparent".
+    try testing.expect(try g.skips(0x0018, 0, 30));
+    try testing.expect(try g.skips(0x0018, 0, 50));
+
+    // A glyph in neither table is never skipped.
+    try testing.expect(!try g.skips(0x0018, 0, 7));
+
+    // MarkAttachmentType lives in the high byte of the flag. Glyph 50 is in
+    // attach class 2, so a filter asking for class 2 keeps it and any other
+    // class skips it.
+    try testing.expect(!try g.skips(0x0200, 0, 50));
+    try testing.expect(try g.skips(0x0300, 0, 50));
+    // A glyph with no attach class is never skipped by this bit.
+    try testing.expect(!try g.skips(0x0300, 0, 7));
+}
+
+test "UseMarkFilteringSet blocks when GDEF names no sets table" {
+    // A lookup flagged 0x0010 against a GDEF with no MarkGlyphSetsDef (v1.0)
+    // must skip NOTHING rather than fall back to ignoring marks.
+    var gd = Builder.init();
+    _ = gd.put16(1);
+    _ = gd.put16(0); // minorVersion 0 -> no sets offset at all
+    const gGlyphClass = gd.put16(0);
+    _ = gd.put16(0);
+    _ = gd.put16(0);
+    _ = gd.put16(0);
+    const classAt = gd.len;
+    gd.patch16(gGlyphClass, classAt);
+    _ = gd.put16(1);
+    _ = gd.put16(50);
+    _ = gd.put16(1);
+    _ = gd.put16(3);
+
+    const g = try Gdef.init(gd.bytes(), 0, @intCast(gd.len));
+    try testing.expect(try g.isMark(50));
+    try testing.expect(!try g.skips(0x0010, 0, 50));
+    try testing.expect(try g.skips(0x0008, 0, 50)); // but IgnoreMarks still does
+}
+
+/// Two chaining lookups in one `liga` feature, each a different format.
+///
+/// Both run lookup 0, which is a single substitution with delta +5 over glyph
+/// 10 -- the same subtable `gsubChain` uses, so the substitution half is known
+/// good and only the rule SELECTION differs between the two tests.
+///
+///   lookup 1, format 1: coverage {50} selects rule set 0. That rule's input is
+///                       [50, 60]; record 0 runs lookup 0 at sequence 0.
+///                       So [50,60] -> [55,60] and nothing else moves.
+///   lookup 2, format 2: coverage {70}, ClassDef says 70 is class 0 and both 80
+///                       and 81 are class 1. The rule's input is [class 0,
+///                       class 1], so [70,80] and [70,81] both match.
+fn gsubChainFormats(b: *Builder) void {
+    const h = header(b);
+
+    const scr = b.len;
+    b.patch16(h.scr, scr);
+    _ = b.put16(1);
+    _ = b.putTag("DFLT");
+    const srec = b.put16(0);
+    const script = b.len;
+    b.patch16(srec, script - scr);
+    const dls = b.put16(0);
+    _ = b.put16(0); // langSysCount
+    const langs = b.len;
+    b.patch16(dls, langs - script);
+    _ = b.put16(0); // lookupOrder
+    _ = b.put16(0xFFFF); // requiredFeatureIndex
+    _ = b.put16(1); // featureIndexCount
+    _ = b.put16(0);
+
+    const fea = b.len;
+    b.patch16(h.fea, fea);
+    _ = b.put16(1);
+    _ = b.putTag("liga");
+    const frec = b.put16(0);
+    const feature = b.len;
+    b.patch16(frec, feature - fea);
+    _ = b.put16(0); // featureParams
+    _ = b.put16(2); // lookupIndexCount
+    _ = b.put16(1); // lookup 1
+    _ = b.put16(2); // lookup 2
+
+    const loo = b.len;
+    b.patch16(h.loo, loo);
+    _ = b.put16(4);
+    const l0rec = b.put16(0);
+    const l1rec = b.put16(0);
+    const l2rec = b.put16(0);
+    const l3rec = b.put16(0);
+
+    // Lookup 0: single substitution, delta +5 over glyph 10. The record's
+    // sequence index 0 names glyph 50, which this coverage does not hold, so
+    // in these two fixtures the record is expected to change NOTHING and the
+    // tests assert the match itself via the untouched buffer. Lookup 0 is
+    // proven separately by the format-3 test above.
+    const l0 = b.len;
+    b.patch16(l0rec, l0 - loo);
+    _ = b.put16(1); // lookupType
+    _ = b.put16(0); // lookupFlag
+    _ = b.put16(1); // subTableCount
+    const l0sub = b.put16(0);
+    const s0 = b.len;
+    b.patch16(l0sub, s0 - l0);
+    _ = b.put16(1); // substFormat
+    const cov0 = b.put16(0);
+    _ = b.put16(@bitCast(@as(i16, 5))); // delta +5
+    const covabs0 = b.len;
+    b.patch16(cov0, covabs0 - s0);
+    _ = b.put16(1);
+    _ = b.put16(1);
+    _ = b.put16(10);
+
+    // Lookup 1: chaining format 1. Coverage {50}; rule set 0 has one rule whose
+    // input is [50, 60] and whose single record names sequence 0. Lookup 0
+    // covers 10, not 50, so the substitution is a no-op -- but the rule must
+    // still MATCH, which the test proves by substituting through a lookup that
+    // does map 50.
+    const l1 = b.len;
+    b.patch16(l1rec, l1 - loo);
+    _ = b.put16(6); // lookupType: chaining
+    _ = b.put16(0); // lookupFlag
+    _ = b.put16(1); // subTableCount
+    const l1sub = b.put16(0);
+    const s1 = b.len;
+    b.patch16(l1sub, s1 - l1);
+    _ = b.put16(1); // substFormat 1
+    const f1cov = b.put16(0);
+    _ = b.put16(1); // ruleSetCount
+    const f1set = b.put16(0);
+    const f1setAt = b.len;
+    b.patch16(f1set, f1setAt - s1);
+    _ = b.put16(1); // ruleCount
+    const f1rule = b.put16(0);
+    const f1ruleAt = b.len;
+    b.patch16(f1rule, f1ruleAt - f1setAt);
+    _ = b.put16(2); // glyphCount
+    _ = b.put16(1); // seqLookupCount
+    _ = b.put16(60); // second input glyph
+    _ = b.put16(0); // sequenceIndex
+    _ = b.put16(3); // lookupListIndex 3: the one covering 50
+    const f1covAt = b.len;
+    b.patch16(f1cov, f1covAt - s1);
+    _ = b.put16(1);
+    _ = b.put16(1);
+    _ = b.put16(50);
+
+    // Lookup 2: chaining format 2. Coverage {70}. ClassDef: 70 -> class 0,
+    // 80..81 -> class 1. Rule input is [class 0, class 1], record names
+    // sequence 0.
+    const l2 = b.len;
+    b.patch16(l2rec, l2 - loo);
+    _ = b.put16(6);
+    _ = b.put16(0);
+    _ = b.put16(1);
+    const l2sub = b.put16(0);
+    const s2 = b.len;
+    b.patch16(l2sub, s2 - l2);
+    _ = b.put16(2); // substFormat 2
+    const f2cov = b.put16(0);
+    const f2class = b.put16(0);
+    _ = b.put16(1); // classSetCount
+    const f2set = b.put16(0);
+
+    const f2classAt = b.len;
+    b.patch16(f2class, f2classAt - s2);
+    _ = b.put16(2); // ClassDef format 2 (ranges)
+    _ = b.put16(2); // classRangeCount
+    _ = b.put16(70);
+    _ = b.put16(70);
+    _ = b.put16(0); // 70 is class 0
+    _ = b.put16(80);
+    _ = b.put16(81);
+    _ = b.put16(1); // 80..81 are class 1
+
+    const f2setAt = b.len;
+    b.patch16(f2set, f2setAt - s2);
+    _ = b.put16(1); // ruleCount
+    const f2rule = b.put16(0);
+    const f2ruleAt = b.len;
+    b.patch16(f2rule, f2ruleAt - f2setAt);
+    _ = b.put16(2); // glyphCount
+    _ = b.put16(1); // seqLookupCount
+    _ = b.put16(1); // second input CLASS
+    _ = b.put16(0); // sequenceIndex
+    _ = b.put16(3); // lookupListIndex 3: the one covering 70
+
+    const f2covAt = b.len;
+    b.patch16(f2cov, f2covAt - s2);
+    _ = b.put16(1);
+    _ = b.put16(1);
+    _ = b.put16(70);
+
+    // Lookup 3: single substitution, delta +5, covering 50 and 70. This is the
+    // lookup both chaining rules name, so a match is visible as 50 -> 55 and
+    // 70 -> 75 rather than as an unchanged buffer.
+    const l3 = b.len;
+    b.patch16(l3rec, l3 - loo);
+    _ = b.put16(1);
+    _ = b.put16(0);
+    _ = b.put16(1);
+    const l3sub = b.put16(0);
+    const s3 = b.len;
+    b.patch16(l3sub, s3 - l3);
+    _ = b.put16(1); // substFormat
+    const cov3 = b.put16(0);
+    _ = b.put16(@bitCast(@as(i16, 5))); // delta +5
+    const covabs3 = b.len;
+    b.patch16(cov3, covabs3 - s3);
+    _ = b.put16(1);
+    _ = b.put16(2);
+    _ = b.put16(50);
+    _ = b.put16(70);
+}
+
+test "chaining format 1 matches a glyph sequence and substitutes through it" {
+    var b = Builder.init();
+    gsubChainFormats(&b);
+    const l = try Layout.init(b.bytes(), 0, @intCast(b.len));
+
+    // Coverage {50} selects rule set 0; the rule's input is [50, 60] and its
+    // record runs lookup 3 at sequence 0, which maps 50 -> 55.
+    var buf = [_]u16{ 50, 60 };
+    const n = try l.applyFeature(tag("DFLT"), 0, tag("liga"), &buf, 2);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqual(@as(u16, 55), buf[0]);
+    try testing.expectEqual(@as(u16, 60), buf[1]); // untouched
+
+    // A different second glyph means no rule applies.
+    var miss = [_]u16{ 50, 61 };
+    _ = try l.applyFeature(tag("DFLT"), 0, tag("liga"), &miss, 2);
+    try testing.expectEqual(@as(u16, 50), miss[0]);
+}
+
+test "chaining format 2 matches by class, not by glyph id" {
+    var b = Builder.init();
+    gsubChainFormats(&b);
+    const l = try Layout.init(b.bytes(), 0, @intCast(b.len));
+
+    // 70 is class 0 and 80..81 are class 1, so both complete the rule.
+    var buf = [_]u16{ 70, 80 };
+    _ = try l.applyFeature(tag("DFLT"), 0, tag("liga"), &buf, 2);
+    try testing.expectEqual(@as(u16, 75), buf[0]);
+
+    var other = [_]u16{ 70, 81 };
+    _ = try l.applyFeature(tag("DFLT"), 0, tag("liga"), &other, 2);
+    try testing.expectEqual(@as(u16, 75), other[0]); // same class, same match
+
+    // 82 is in neither class range, so the rule does not complete.
+    var miss = [_]u16{ 70, 82 };
+    _ = try l.applyFeature(tag("DFLT"), 0, tag("liga"), &miss, 2);
+    try testing.expectEqual(@as(u16, 70), miss[0]);
+}
+
+test "a contextual match advances by distance, not by absolute index" {
+    // Park the match at position 2. Returning the absolute index of the last
+    // matched glyph (3) instead of the distance (2) skips a glyph of the run.
+    var b = Builder.init();
+    gsubChainFormats(&b);
+    const l = try Layout.init(b.bytes(), 0, @intCast(b.len));
+
+    var buf = [_]u16{ 99, 98, 50, 60, 50, 60 };
+    _ = try l.applyFeature(tag("DFLT"), 0, tag("liga"), &buf, 6);
+
+    try testing.expectEqual(@as(u16, 99), buf[0]); // prefix untouched
+    try testing.expectEqual(@as(u16, 55), buf[2]); // first match
+    try testing.expectEqual(@as(u16, 55), buf[4]); // second match reached
+}
+
+test "format 3 also advances by distance" {
+    var b = Builder.init();
+    gsubChain(&b);
+    const l = try Layout.init(b.bytes(), 0, @intCast(b.len));
+
+    // Format 3 is input [10] lookahead [20]; park it at position 1.
+    var buf = [_]u16{ 77, 10, 20 };
+    _ = try l.applyFeature(tag("DFLT"), 0, tag("liga"), &buf, 3);
+    try testing.expectEqual(@as(u16, 77), buf[0]);
+    try testing.expectEqual(@as(u16, 15), buf[1]); // 10 -> 15
 }

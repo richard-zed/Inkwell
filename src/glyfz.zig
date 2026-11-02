@@ -752,6 +752,7 @@ pub const Font = struct {
         const cm = try self.slice(self.cmap);
         const n = try u16At(cm, 2);
         var chosen: ?u32 = null;
+        var best: u8 = 0;
 
         var i: usize = 0;
         while (i < n) : (i += 1) {
@@ -759,12 +760,25 @@ pub const Font = struct {
             const plat = try u16At(cm, rec);
             const enc = try u16At(cm, rec + 2);
             const off = try u32At(cm, rec + 4);
-            const ok = switch (plat) {
-                3 => enc == 1 or enc == 10,
-                0 => true,
-                else => false,
+            // Rank, not a filter. Keeping the LAST acceptable record (which
+            // this did) makes the choice depend on file order, so a face that
+            // lists its BMP table after its full-repertoire one serves format
+            // 4 and silently cannot see a single astral codepoint it carries.
+            // Windows UCS-4 beats Windows BMP beats Unicode-platform, and the
+            // format check below is the final word on whether it is usable.
+            const rank: u8 = switch (plat) {
+                3 => switch (enc) {
+                    10 => 3,
+                    1 => 2,
+                    else => 0,
+                },
+                0 => 1,
+                else => 0,
             };
-            if (ok) chosen = off;
+            if (rank > best) {
+                best = rank;
+                chosen = off;
+            }
         }
 
         const off = chosen orelse return error.UnsupportedCmap;
@@ -804,6 +818,47 @@ pub const Font = struct {
     pub fn hasCodepoint(self: Font, cp: u21) bool {
         const gid = self.glyphIndex(cp) catch return false;
         return gid != 0;
+    }
+
+    /// Which face in a chain should draw this codepoint.
+    ///
+    /// The chain is ordered by preference, so the FIRST face that maps the
+    /// codepoint to a real glyph wins. That ordering is the whole contract: a
+    /// Latin text face, then a CJK face, then a symbol face is a chain, and
+    /// asking the symbol face first would replace every letter with an icon
+    /// it happens to also cover.
+    ///
+    /// Returns the FACE, not just an index, because the caller immediately
+    /// needs its glyph id and its advances, and looking the face up twice is
+    /// how a chain ends up with two different answers in one draw.
+    pub fn pick(faces: []const Font, cp: u21) ?Font {
+        for (faces) |f| {
+            if (f.hasCodepoint(cp)) return f;
+        }
+        return null;
+    }
+
+    /// Index of the face that should draw `cp`, or null when none can.
+    ///
+    /// `pick` with the answer the layout pass usually wants, since it holds
+    /// the faces and not a copy of one.
+    pub fn pickIndex(faces: []const Font, cp: u21) ?usize {
+        for (faces, 0..) |f, i| {
+            if (f.hasCodepoint(cp)) return i;
+        }
+        return null;
+    }
+
+    /// Index of a designated fallback face: where to send a codepoint that no
+    /// face in the chain maps.
+    ///
+    /// A face that covers nearly everything is the usual choice, and it is
+    /// named explicitly rather than found by scanning, because "the face with
+    /// the most glyphs" is a different question from "the face that should
+    /// draw a box".
+    pub fn fallbackIndex(faces: []const Font) ?usize {
+        if (faces.len == 0) return null;
+        return faces.len - 1;
     }
 
     /// A `name`-table string, decoded to UTF-8 into `out`.
@@ -3928,6 +3983,20 @@ fn buildLangsysTestFont(buf: []u8) []const u8 {
 }
 
 fn buildTestFontImpl(buf: []u8, with_fmt12: bool, comptime with_var: bool, comptime gsub: GsubKind) []const u8 {
+    return buildTestFontOrdered(buf, with_fmt12, with_var, gsub, false);
+}
+
+/// A face whose `cmap` lists platform 3/encoding 1 BEFORE 3/10.
+///
+/// Running order is the whole point: the old selector kept the LAST acceptable
+/// record, so this arrangement made it serve the BMP-only format 4 table and
+/// lose every astral codepoint the format 12 table actually maps. The default
+/// fixture lists 3/1 first, which is the arrangement where the bug hides.
+fn buildReversedCmapTestFont(buf: []u8) []const u8 {
+    return buildTestFontOrdered(buf, true, false, .none, true);
+}
+
+fn buildTestFontOrdered(buf: []u8, with_fmt12: bool, comptime with_var: bool, comptime gsub: GsubKind, reversed: bool) []const u8 {
     const ntables: usize = 8 + (if (with_var) 3 else 0) + (if (gsub != .none) 1 else 0);
     var w = W{ .buf = buf };
 
@@ -3943,16 +4012,30 @@ fn buildTestFontImpl(buf: []u8, with_fmt12: bool, comptime with_var: bool, compt
     const cmap_start = w.at;
     w.u16v(0); // version
     w.u16v(if (with_fmt12) 2 else 1);
-    const rec0 = w.at;
-    w.u16v(3);
-    w.u16v(1);
-    w.u32v(0);
-    var rec1: usize = 0;
-    if (with_fmt12) {
-        rec1 = w.at;
+    // `rec_bmp` gets the format 4 subtable, `rec_ucs4` the format 12 one,
+    // whichever order they appear in.
+    var rec_bmp: usize = 0;
+    var rec_ucs4: usize = 0;
+    if (with_fmt12 and reversed) {
+        rec_ucs4 = w.at;
         w.u16v(3);
         w.u16v(10);
         w.u32v(0);
+        rec_bmp = w.at;
+        w.u16v(3);
+        w.u16v(1);
+        w.u32v(0);
+    } else {
+        rec_bmp = w.at;
+        w.u16v(3);
+        w.u16v(1);
+        w.u32v(0);
+        if (with_fmt12) {
+            rec_ucs4 = w.at;
+            w.u16v(3);
+            w.u16v(10);
+            w.u32v(0);
+        }
     }
 
     const f4 = w.at;
@@ -3979,7 +4062,7 @@ fn buildTestFontImpl(buf: []u8, with_fmt12: bool, comptime with_var: bool, compt
     w.u16v(0);
     w.u16v(1); // glyphIdArray[0]
     w16(buf[0..], len4_at, @intCast(w.at - f4));
-    w32(buf, rec0 + 4, @intCast(f4 - cmap_start));
+    w32(buf, rec_bmp + 4, @intCast(f4 - cmap_start));
 
     if (with_fmt12) {
         const f12 = w.at;
@@ -3996,7 +4079,7 @@ fn buildTestFontImpl(buf: []u8, with_fmt12: bool, comptime with_var: bool, compt
         w.u32v(0x1F600);
         w.u32v(7);
         w32(buf, len12_at, @intCast(w.at - f12));
-        w32(buf, rec1 + 4, @intCast(f12 - cmap_start));
+        w32(buf, rec_ucs4 + 4, @intCast(f12 - cmap_start));
     }
     const r_cmap = Rec{ .at = cmap_start, .len = w.at - cmap_start };
 
@@ -6736,4 +6819,56 @@ test "adjustAdvances zeroes its output even when the face has no GPOS" {
 
     // An empty run is not an error either.
     try std.testing.expectEqual(@as(usize, 0), font.adjustAdvances(&.{}, &out, &.{opentype.tag("palt")}, .{}));
+}
+
+test "cmap selection prefers the full repertoire over file order" {
+    // The fixture lists 3/10 (UCS-4, format 12) BEFORE 3/1 (BMP, format 4).
+    // A selector that keeps the last acceptable record picks format 4 here and
+    // cannot see the astral codepoint at all.
+    var rev_buf: [2048]u8 = undefined;
+    const rev = try Font.init(buildReversedCmapTestFont(&rev_buf));
+    try std.testing.expectEqual(@as(u16, 12), rev.cmap_format);
+    try std.testing.expect(rev.hasCodepoint('A'));
+    try std.testing.expect(rev.hasCodepoint(0x1F600)); // only format 12 has it
+
+    // The same face with the records in the ordinary order must agree, so the
+    // choice is a property of the tables and not of where they were written.
+    var ord_buf: [2048]u8 = undefined;
+    const ord = try Font.init(buildTestFont(&ord_buf, true));
+    try std.testing.expectEqual(@as(u16, 12), ord.cmap_format);
+    try std.testing.expect(ord.hasCodepoint(0x1F600));
+
+    // A BMP-only face still loads: preferring format 12 must not refuse a face
+    // that never had one.
+    var bmp_buf: [2048]u8 = undefined;
+    const bmp = try Font.init(buildTestFont(&bmp_buf, false));
+    try std.testing.expectEqual(@as(u16, 4), bmp.cmap_format);
+    try std.testing.expect(bmp.hasCodepoint('A'));
+}
+
+test "a chain picks the first face that can draw the codepoint" {
+    var bmp_buf: [2048]u8 = undefined;
+    var full_buf: [2048]u8 = undefined;
+    const bmp = try Font.init(buildTestFont(&bmp_buf, false));
+    const full = try Font.init(buildTestFont(&full_buf, true));
+
+    // Order is preference, not capability: the BMP face is first because it is
+    // the text face, and the astral codepoint falls through to the second.
+    const chain = [_]Font{ bmp, full };
+    try std.testing.expectEqual(@as(usize, 0), Font.pickIndex(&chain, 'A').?);
+    try std.testing.expectEqual(@as(usize, 1), Font.pickIndex(&chain, 0x1F600).?);
+
+    // A codepoint neither face maps is absent from the chain entirely, which
+    // is what lets a caller fall through to a designated fallback face.
+    try std.testing.expect(Font.pickIndex(&chain, 0x10FFFF) == null);
+    try std.testing.expect(Font.pick(&chain, 0x10FFFF) == null);
+
+    // Reversed order changes the answer for 'A', which is the point: the chain
+    // is consulted in order and the first yes wins.
+    const rev_chain = [_]Font{ full, bmp };
+    try std.testing.expectEqual(@as(usize, 0), Font.pickIndex(&rev_chain, 0x1F600).?);
+
+    // pick returns the face itself, so the caller gets its advances too.
+    const hit = Font.pick(&rev_chain, 0x1F600).?;
+    try std.testing.expectEqual(full.glyphIndex(0x1F600) catch 0, hit.glyphIndex(0x1F600) catch 0);
 }

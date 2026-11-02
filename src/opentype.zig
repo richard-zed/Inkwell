@@ -856,6 +856,132 @@ pub const Layout = struct {
         return self.runRecords(rec_off, rec_n, positions[0..got], pos, buf, len, depth);
     }
 
+    /// GSUB 5 contextual substitution. Formats 1 and 2 have no backtrack and no
+    /// lookahead for any position they do not name: the input sequence is the
+    /// whole condition, and it must contain pos. Format 3 does carry flanking
+    /// lists -- it shares GSUB 6 format 3's layout exactly. More permissive
+    /// than type 6 in one way that bites -- an empty RuleSet or an index past
+    /// the set count is a MISS, but a rule whose input does not include pos
+    /// must be skipped while later rules are still tried, so this cannot
+    /// simply take the first rule that matches.
+    fn contextAt(self: Layout, sub: usize, buf: []u16, len: usize, pos: usize, depth: u4, flags: u16, set: u16) Error!Step {
+        const fmt = try u16At(self.data, sub);
+        return switch (fmt) {
+            1 => self.contextGlyphRules(sub, buf, len, pos, depth, flags, set),
+            2 => self.contextClassRules(sub, buf, len, pos, depth, flags, set),
+            3 => self.contextCoverage(sub, buf, len, pos, depth, flags, set),
+            else => .{},
+        };
+    }
+
+    /// Format 1: the glyph at pos selects a RuleSet; each rule names an input
+    /// glyph sequence, and the one that matches the buffer around pos wins.
+    fn contextGlyphRules(self: Layout, sub: usize, buf: []u16, len: usize, pos: usize, depth: u4, flags: u16, set: u16) Error!Step {
+        const cov = sub + try u16At(self.data, sub + 2);
+        const idx = (try self.coverageIndex(cov, buf[pos])) orelse return .{};
+        const set_n = try u16At(self.data, sub + 4);
+        if (idx >= set_n) return .{};
+        const set_rel = try u16At(self.data, sub + 6 + @as(usize, idx) * 2);
+        if (set_rel == 0) return .{};
+        const set_at = sub + set_rel;
+        const rule_n = try u16At(self.data, set_at);
+        var r: usize = 0;
+        while (r < rule_n) : (r += 1) {
+            const rule = set_at + try u16At(self.data, set_at + 2 + r * 2);
+            if (try self.contextRule(rule, null, buf, len, pos, depth, flags, set)) |st| return st;
+        }
+        return .{};
+    }
+
+    /// Format 2: as format 1, but the rule's input sequence is CLASSES resolved
+    /// through `class_def`.
+    fn contextClassRules(self: Layout, sub: usize, buf: []u16, len: usize, pos: usize, depth: u4, flags: u16, set: u16) Error!Step {
+        const cov = sub + try u16At(self.data, sub + 2);
+        const idx = (try self.coverageIndex(cov, buf[pos])) orelse return .{};
+        const class_def = sub + try u16At(self.data, sub + 4);
+        const set_n = try u16At(self.data, sub + 6);
+        if (idx >= set_n) return .{};
+        const set_rel = try u16At(self.data, sub + 8 + @as(usize, idx) * 2);
+        if (set_rel == 0) return .{};
+        const set_at = sub + set_rel;
+        const rule_n = try u16At(self.data, set_at);
+        var r: usize = 0;
+        while (r < rule_n) : (r += 1) {
+            const rule = set_at + try u16At(self.data, set_at + 2 + r * 2);
+            const rr = try self.contextRule(rule, class_def, buf, len, pos, depth, flags, set);
+            if (rr) |st| return st;
+        }
+        return .{};
+    }
+
+    /// One ContextRule. `class_def` null means the input sequence is glyph ids.
+    ///
+    /// The rule may start BEFORE pos: its first input slot can sit anywhere in
+    /// the window, so every candidate alignment whose span covers pos is tried.
+    /// Without that, a rule matched at the wrong slot would fire a record at a
+    /// sequence index naming some other glyph.
+    fn contextRule(self: Layout, rule: usize, class_def: ?usize, buf: []u16, len: usize, pos: usize, depth: u4, flags: u16, set: u16) Error!?Step {
+        const glyph_n = try u16At(self.data, rule);
+        const rec_n = try u16At(self.data, rule + 2);
+        if (glyph_n == 0 or glyph_n > 16) return null;
+        // rule+0 glyphCount, rule+2 seqLookupCount, rule+4 input sequence.
+        const inputs = rule + 4;
+        const recs = inputs + @as(usize, glyph_n) * 2;
+
+        // Collect the non-skipped positions of the whole buffer once.
+        var idxs: [64]usize = undefined;
+        var n: usize = 0;
+        for (0..len) |i| {
+            if (try self.skipsGlyph(flags, set, buf[i])) continue;
+            if (n == idxs.len) break;
+            idxs[n] = i;
+            n += 1;
+        }
+        const here = for (0..n) |i| {
+            if (idxs[i] == pos) break i;
+        } else return null;
+
+        // The span must begin at or before pos and end at or after it.
+        const first_min: isize = @as(isize, @intCast(here)) - @as(isize, @intCast(glyph_n - 1));
+        const first_max: isize = @intCast(here);
+        var first = if (first_min < 0) 0 else first_min;
+        while (first <= first_max) : (first += 1) {
+            const start: usize = @intCast(first);
+            if (start + glyph_n > n) break;
+            var ok = true;
+            for (0..glyph_n) |g| {
+                const got = try u16At(self.data, rule + 4 + g * 2);
+                const at = buf[idxs[start + g]];
+                const val: u16 = if (class_def) |cd| try self.classOf(cd, at) else at;
+                if (val != got) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (!ok) continue;
+            var positions: [16]usize = undefined;
+            for (0..glyph_n) |g| positions[g] = idxs[start + g];
+            return try self.runRecords(recs, rec_n, positions[0..glyph_n], pos, buf, len, depth);
+        }
+        return null;
+    }
+
+    /// Format 3: explicit coverages for the input, in order, starting at ps.
+    fn contextCoverage(self: Layout, sub: usize, buf: []u16, len: usize, pos: usize, depth: u4, flags: u16, set: u16) Error!Step {
+        // GSUB 5 format 3 and GSUB 6 format 3 spell out the SAME structure:
+        //   format, backtrackCount, backtrackCov[], inputCount, inputCov[],
+        //   lookaheadCount, lookaheadCov[], substCount, records[]
+        // Only the lookup kind differs, and by the time we are here that is
+        // already known, so there is one reader rather than two.
+        //
+        // This used to be a second copy that read inputCount, skipped the
+        // input offsets, then took the LOOKAHEAD count as the record count.
+        // Every fixture was written to match the misread layout -- no
+        // backtrack, no lookahead, one record -- so the wrong field held the
+        // right number and nothing ever caught it.
+        return self.chainCoverage(sub, buf, len, pos, depth, flags, set);
+    }
+
     /// GPOS type 4, mark-to-base. Each mark glyph offsets itself by
     /// (base anchor - mark anchor) for its class, so a fatha lands where the
     /// font drew that letter's room for one rather than on the baseline.
@@ -1268,6 +1394,7 @@ pub const Layout = struct {
         // Contextual lookups gate other lookups rather than substituting a
         // glyph, so they do not have a coverage table at offset 2.
         if (kind == 6) return self.chainAt(sub, buf, len, pos, depth, flags, set);
+        if (kind == 5) return self.contextAt(sub, buf, len, pos, depth, flags, set);
         const gid = buf[pos];
         const cov = sub + try u16At(self.data, sub + 2);
         const idx = (try self.coverageIndex(cov, gid)) orelse return .{};
@@ -2551,4 +2678,317 @@ test "format 3 also advances by distance" {
     _ = try l.applyFeature(tag("DFLT"), 0, tag("liga"), &buf, 3);
     try testing.expectEqual(@as(u16, 77), buf[0]);
     try testing.expectEqual(@as(u16, 15), buf[1]); // 10 -> 15
+}
+
+/// Two GSUB 5 lookups in one `liga` feature, formats 1 and 2, both running
+/// lookup 0: a delta +5 single substitution over glyphs 50 and 70.
+///
+///   lookup 1 (format 1): coverage {50,51}; both glyphs key rule set 0. The one
+///     rule's input is [50, 51] and its record runs lookup 0 at sequence 0,
+///     which maps 50 -> 55.
+///   lookup 2 (format 2): coverage {70}; ClassDef makes 70 class 0 and 80..81
+///     class 1, so [70,80] and [70,81] both match the [0,1] rule. The record
+///     runs lookup 0 at sequence 0, giving 70 -> 75.
+fn gsubContextFormats(b: *Builder) void {
+    const h = header(b);
+
+    const scr = b.len;
+    b.patch16(h.scr, scr);
+    _ = b.put16(1);
+    _ = b.putTag("DFLT");
+    const srec = b.put16(0);
+    const script = b.len;
+    b.patch16(srec, script - scr);
+    const dls = b.put16(0);
+    _ = b.put16(0);
+    const langs = b.len;
+    b.patch16(dls, langs - script);
+    _ = b.put16(0);
+    _ = b.put16(0xFFFF);
+    _ = b.put16(1);
+    _ = b.put16(0);
+
+    const fea = b.len;
+    b.patch16(h.fea, fea);
+    _ = b.put16(1);
+    _ = b.putTag("liga");
+    const frec = b.put16(0);
+    const feature = b.len;
+    b.patch16(frec, feature - fea);
+    _ = b.put16(0);
+    _ = b.put16(2);
+    _ = b.put16(1);
+    _ = b.put16(2);
+
+    const loo = b.len;
+    b.patch16(h.loo, loo);
+    _ = b.put16(3);
+    const l0rec = b.put16(0);
+    const l1rec = b.put16(0);
+    const l2rec = b.put16(0);
+
+    // Lookup 0: delta +5 over 50 and 70.
+    const l0 = b.len;
+    b.patch16(l0rec, l0 - loo);
+    _ = b.put16(1);
+    _ = b.put16(0);
+    _ = b.put16(1);
+    const l0sub = b.put16(0);
+    const s0 = b.len;
+    b.patch16(l0sub, s0 - l0);
+    _ = b.put16(1);
+    const cov0 = b.put16(0);
+    _ = b.put16(@bitCast(@as(i16, 5)));
+    const covabs0 = b.len;
+    b.patch16(cov0, covabs0 - s0);
+    _ = b.put16(1);
+    _ = b.put16(2);
+    _ = b.put16(50);
+    _ = b.put16(70);
+
+    // Lookup 1: GSUB 5 format 1. Coverage {50,51}, two rule sets, both
+    // holding the same rule [50,51].
+    const l1 = b.len;
+    b.patch16(l1rec, l1 - loo);
+    _ = b.put16(5);
+    _ = b.put16(0);
+    _ = b.put16(1);
+    const l1sub = b.put16(0);
+    const s1 = b.len;
+    b.patch16(l1sub, s1 - l1);
+    _ = b.put16(1); // substFormat
+    const f1cov = b.put16(0);
+    _ = b.put16(2); // ruleSetCount, one per covered glyph
+    const f1set0 = b.put16(0);
+    const f1set1 = b.put16(0);
+
+    // The rule set offsets are relative to the START OF THIS ARRAY, so both
+    // are measured from f1setAt and the sets themselves begin right after the
+    // two offset slots.
+    // RuleSet offsets are relative to the SUBTABLE start, per the spec, and the
+    // reader adds them to `sub` -- not to the offset array.
+    const setA = writeContextRuleSet(b, 50, 51, 0);
+    b.patch16(f1set0, setA - s1);
+    // Set 1 (glyph 51) demands an input beginning 99, which no test buffer has.
+    // If the reader picks a rule set by position instead of by coverage, glyph
+    // 50 falls into this set and the substitution does not happen.
+    const setB = writeContextRuleSet(b, 99, 51, 0);
+    b.patch16(f1set1, setB - s1);
+
+    const f1covAt = b.len;
+    b.patch16(f1cov, f1covAt - s1);
+    _ = b.put16(1);
+    _ = b.put16(2);
+    _ = b.put16(50);
+    _ = b.put16(51);
+
+    // Lookup 2: GSUB 5 format 2. Coverage {70}, ClassDef 70->0, 80..81->1.
+    const l2 = b.len;
+    b.patch16(l2rec, l2 - loo);
+    _ = b.put16(5);
+    _ = b.put16(0);
+    _ = b.put16(1);
+    const l2sub = b.put16(0);
+    const s2 = b.len;
+    b.patch16(l2sub, s2 - l2);
+    _ = b.put16(2); // substFormat
+    const f2cov = b.put16(0);
+    const f2class = b.put16(0);
+    _ = b.put16(1); // classSetCount
+    const f2set = b.put16(0);
+
+    const f2classAt = b.len;
+    b.patch16(f2class, f2classAt - s2);
+    _ = b.put16(2);
+    _ = b.put16(2);
+    _ = b.put16(70);
+    _ = b.put16(70);
+    _ = b.put16(0);
+    _ = b.put16(80);
+    _ = b.put16(81);
+    _ = b.put16(1);
+
+    const f2setAt = b.len;
+    b.patch16(f2set, f2setAt - s2);
+    _ = b.put16(1); // ruleCount
+    const f2rule = b.put16(0);
+    const f2ruleAt = b.len;
+    b.patch16(f2rule, f2ruleAt - f2setAt);
+    _ = b.put16(2); // glyphCount
+    _ = b.put16(1); // seqLookupCount
+    _ = b.put16(0); // first input CLASS
+    _ = b.put16(1); // second input CLASS
+    _ = b.put16(0); // sequenceIndex 0
+    _ = b.put16(0); // lookup 0
+
+    const f2covAt = b.len;
+    b.patch16(f2cov, f2covAt - s2);
+    _ = b.put16(1);
+    _ = b.put16(1);
+    _ = b.put16(70);
+}
+
+/// A ContextRuleSet holding one ContextRule whose input is [a, b] and whose
+/// single record runs lookup 0 at `seq`. Returns the set's absolute offset.
+fn writeContextRuleSet(b: *Builder, a: u16, b2: u16, seq: u16) usize {
+    const set_at = b.len;
+    _ = b.put16(1); // ruleCount
+    const rule = b.put16(0);
+    const ruleAt = b.len;
+    b.patch16(rule, ruleAt - set_at);
+    _ = b.put16(2); // glyphCount
+    _ = b.put16(1); // seqLookupCount
+    _ = b.put16(a);
+    _ = b.put16(b2);
+    _ = b.put16(seq);
+    _ = b.put16(0); // lookup 0
+    return set_at;
+}
+
+/// GSUB type 5 format 3 lives in its own fixture because, unlike types 1 and 2,
+/// its input sequence is a list of coverage offsets rather than glyph or class
+/// ids. The record runs lookup 0 at sequence index 0, so [50,51] -> [55,51].
+///
+/// Nothing exercised this path before: format 3 is shared with GSUB 6 and every
+/// existing format-3 test reaches it through type 6, which passes a different
+/// header layout. A type-5 subtable puts backtrackGlyphCount first.
+fn gsubContextFormat3(b: *Builder) void {
+    const h = header(b);
+
+    const scr = b.len;
+    b.patch16(h.scr, scr);
+    _ = b.put16(1);
+    _ = b.putTag("DFLT");
+    const srec = b.put16(0);
+    const script = b.len;
+    b.patch16(srec, script - scr);
+    const dls = b.put16(0);
+    _ = b.put16(0);
+    const langs = b.len;
+    b.patch16(dls, langs - script);
+    _ = b.put16(0);
+    _ = b.put16(0xFFFF);
+    _ = b.put16(1);
+    _ = b.put16(0);
+
+    const fea = b.len;
+    b.patch16(h.fea, fea);
+    _ = b.put16(1);
+    _ = b.putTag("liga");
+    const frec = b.put16(0);
+    const feature = b.len;
+    b.patch16(frec, feature - fea);
+    _ = b.put16(0);
+    _ = b.put16(1); // lookupCount
+    // Only the contextual lookup is listed. The substitution is reachable
+    // solely through its record, so a lookahead miss means the buffer is
+    // untouched -- if lookup 0 were also listed it would fire on its own
+    // and the negative case could never go red.
+    _ = b.put16(1); // index 0: the contextual lookup
+
+    const loo = b.len;
+    b.patch16(h.loo, loo);
+    _ = b.put16(2);
+    const l0rec = b.put16(0);
+    const l1rec = b.put16(0);
+
+    // Lookup 0: delta +5 over 50.
+    const l0 = b.len;
+    b.patch16(l0rec, l0 - loo);
+    _ = b.put16(1);
+    _ = b.put16(0);
+    _ = b.put16(1);
+    const l0sub = b.put16(0);
+    const l0s1 = b.len;
+    b.patch16(l0sub, l0s1 - l0);
+    _ = b.put16(1); // substFormat
+    const l0cov = b.put16(0);
+    _ = b.put16(5); // delta (format 1 has no glyphCount)
+    const l0covabs = b.len;
+    b.patch16(l0cov, l0covabs - l0s1);
+    _ = b.put16(1);
+    _ = b.put16(1);
+    _ = b.put16(50);
+
+    // Lookup 1: GSUB 5 format 3, input [50], lookahead [51], one record at
+    // sequence index 0 running lookup 0.
+    const l1 = b.len;
+    b.patch16(l1rec, l1 - loo);
+    _ = b.put16(5);
+    _ = b.put16(0);
+    _ = b.put16(1);
+    const l1sub = b.put16(0);
+    const s1 = b.len;
+    b.patch16(l1sub, s1 - l1);
+    _ = b.put16(3); // substFormat
+    _ = b.put16(0); // backtrackGlyphCount
+    _ = b.put16(1); // inputGlyphCount
+    const icov = b.put16(0);
+    _ = b.put16(1); // lookaheadGlyphCount
+    const acov = b.put16(0);
+    _ = b.put16(1); // substCount
+    _ = b.put16(0); // sequenceIndex
+    _ = b.put16(0); // lookupListIndex -> lookup 0
+    const icovabs = b.len;
+    b.patch16(icov, icovabs - s1);
+    _ = b.put16(1);
+    _ = b.put16(1);
+    _ = b.put16(50);
+    const acovabs = b.len;
+    b.patch16(acov, acovabs - s1);
+    _ = b.put16(1);
+    _ = b.put16(1);
+    _ = b.put16(51);
+}
+
+test "contextual format 3 matches through coverage lists" {
+    var b = Builder.init();
+    gsubContextFormat3(&b);
+    const l = try Layout.init(b.bytes(), 0, @intCast(b.len));
+
+    var buf = [_]u16{ 50, 51 };
+    _ = try l.applyFeature(tag("DFLT"), 0, tag("liga"), &buf, 2);
+    try testing.expectEqual(@as(u16, 55), buf[0]); // 50 -> 55, gated on 51 ahead
+    try testing.expectEqual(@as(u16, 51), buf[1]);
+
+    // Without the lookahead glyph the rule must not fire, which is what proves
+    // the lookahead coverage list is actually consulted.
+    var miss = [_]u16{ 50, 99 };
+    _ = try l.applyFeature(tag("DFLT"), 0, tag("liga"), &miss, 2);
+    try testing.expectEqual(@as(u16, 50), miss[0]);
+}
+
+test "contextual format 1 matches a sequence and substitutes through it" {
+    var b = Builder.init();
+    gsubContextFormats(&b);
+    const l = try Layout.init(b.bytes(), 0, @intCast(b.len));
+
+    var buf = [_]u16{ 50, 51 };
+    _ = try l.applyFeature(tag("DFLT"), 0, tag("liga"), &buf, 2);
+    try testing.expectEqual(@as(u16, 55), buf[0]); // 50 -> 55 via seq 0
+    try testing.expectEqual(@as(u16, 51), buf[1]); // untouched
+
+    // The other glyph in the coverage maps to the same rule set, but a buffer
+    // that does not contain the rule's full input must not fire.
+    var miss = [_]u16{ 50, 99 };
+    _ = try l.applyFeature(tag("DFLT"), 0, tag("liga"), &miss, 2);
+    try testing.expectEqual(@as(u16, 50), miss[0]);
+}
+
+test "contextual format 2 matches by class" {
+    var b = Builder.init();
+    gsubContextFormats(&b);
+    const l = try Layout.init(b.bytes(), 0, @intCast(b.len));
+
+    var a = [_]u16{ 70, 80 };
+    _ = try l.applyFeature(tag("DFLT"), 0, tag("liga"), &a, 2);
+    try testing.expectEqual(@as(u16, 75), a[0]);
+
+    var c = [_]u16{ 70, 81 };
+    _ = try l.applyFeature(tag("DFLT"), 0, tag("liga"), &c, 2);
+    try testing.expectEqual(@as(u16, 75), c[0]);
+
+    var miss = [_]u16{ 70, 82 };
+    _ = try l.applyFeature(tag("DFLT"), 0, tag("liga"), &miss, 2);
+    try testing.expectEqual(@as(u16, 70), miss[0]);
 }

@@ -1,6 +1,6 @@
 .{
     .name = .inkwell,
-    .version = "0.5.6",
+    .version = "0.5.7",
     .fingerprint = 0x6ae6660828965efb,
     .minimum_zig_version = "0.16.0",
     .paths = .{

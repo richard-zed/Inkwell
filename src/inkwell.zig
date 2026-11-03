@@ -1,4 +1,4 @@
-//! GlyfZ -- a TrueType font parser and rasteriser.
+//! Inkwell -- a TrueType font parser and rasteriser.
 //!
 //! Reads `glyf`-based fonts, turns outlines into antialiased coverage masks,
 //! and keeps those masks between draws. It shapes Arabic and Thai through their
@@ -9,16 +9,16 @@
 //! 1. **No allocator and no IO.** The font is bytes the caller owns, and every
 //!    working buffer -- outlines, edges, coverage, and the glyph cache itself --
 //!    is the caller's too. Nothing here reaches outside them.
-//! 2. **The spec decides, not the reference.** GlyfZ was developed against
+//! 2. **The spec decides, not the reference.** Inkwell was developed against
 //!    stb_truetype as a differential oracle, which is no longer vendored here.
 //!    Where the two disagreed the disagreement is a finding to write down, not
-//!    a bug in GlyfZ by default. Three are documented: `cmapFormat4` applies
+//!    a bug in Inkwell by default. Three are documented: `cmapFormat4` applies
 //!    `idDelta` to a value fetched through a non-zero `idRangeOffset` where stb
 //!    does not, composite transforms are applied as given where stb multiplies by
 //!    each column's norm, and `SCALED_COMPONENT_OFFSET` is honoured where stb
 //!    ignores it entirely.
 //! 3. **Failures are scoped.** `LoadError` means discard the face;
-//!    `GlyphError` means this one glyph failed and the face is still good. GlyfZ
+//!    `GlyphError` means this one glyph failed and the face is still good. Inkwell
 //!    propagates both and never substitutes a glyph silently -- deciding to keep
 //!    a last-good face needs a fallback chain, which belongs to the caller.
 //!
@@ -57,7 +57,7 @@ const ReadError = error{Truncated};
 /// A table span that is absent or out of range: the only thing `slice` checks.
 const SpanError = error{ Truncated, MissingTable };
 
-/// Failures that mean the bytes will never work. GlyfZ has no second face to
+/// Failures that mean the bytes will never work. Inkwell has no second face to
 /// fall back to, so choosing another font is the caller's policy, not ours.
 pub const LoadError = error{
     /// A read ran past the end of the font, or a table is shorter than the
@@ -288,7 +288,7 @@ pub const Raster = struct {
     coverage: []u8,
 };
 
-/// stb_truetype's curve flattening tolerance, in pixels. GlyfZ uses the same
+/// stb_truetype's curve flattening tolerance, in pixels. Inkwell uses the same
 /// number so the two rasterisers are comparing the same polygons; an exact
 /// quadratic path would remove the tolerance altogether and is a later win.
 pub const flatten_tolerance: f32 = 0.35;
@@ -412,14 +412,14 @@ pub const Font = struct {
     is_cff: bool = false,
 
     /// Parse the table directory and the metrics a caller needs up front.
-    /// Fails loudly: a font GlyfZ cannot read should not silently measure zero.
+    /// Fails loudly: a font Inkwell cannot read should not silently measure zero.
     pub fn init(bytes: []const u8) LoadError!Font {
         return initIndex(bytes, 0);
     }
 
     /// Same, for the Nth face of a font collection (`.ttc`). The existing
     /// backend asks stb for index 0 of every file, so a collection is a file
-    /// users can already point at and GlyfZ refused.
+    /// users can already point at and Inkwell refused.
     pub fn initIndex(bytes: []const u8, index: u32) LoadError!Font {
         var base: usize = 0;
         var is_cff = false;
@@ -587,7 +587,7 @@ pub const Font = struct {
         return self.data[off..end];
     }
 
-    /// True when the font carries a `kern` table GlyfZ could read. An absent
+    /// True when the font carries a `kern` table Inkwell could read. An absent
     /// or malformed one is not an error -- kerning is decoration, and refusing
     /// an otherwise good font over it would be worse -- but it is REPORTABLE,
     /// so a caller can say so instead of wondering why text looks loose.
@@ -893,12 +893,12 @@ pub const Font = struct {
     /// The `post` header, or null when the face has none -- or when it has one
     /// too short to hold the header at all.
     ///
-    /// Same policy as `os2` and `name`: this is decoration, so a table GlyfZ
+    /// Same policy as `os2` and `name`: this is decoration, so a table Inkwell
     /// cannot read costs the caller a fallback, never a face. A caller that
     /// needs to tell "absent" from "broken" has to parse the table itself.
     pub fn post(self: Font) ?Post {
         const tbl = self.slice(self.post_span) catch return null;
-        // The header every version shares. A shorter table is a table GlyfZ
+        // The header every version shares. A shorter table is a table Inkwell
         // cannot read, which for decoration means falling back -- the reads
         // below are then in range by construction, not by luck.
         if (tbl.len < 32) return null;
@@ -1292,7 +1292,7 @@ pub const Font = struct {
 
     pub const ShapeOptions = struct {
         direction: Direction = .ltr,
-        /// OpenType script tag, e.g. `opentype.tag("latn")`. Zero asks GlyfZ to
+        /// OpenType script tag, e.g. `opentype.tag("latn")`. Zero asks Inkwell to
         /// pick one, which means "the script that actually has these features
         /// under it" rather than a hardcoded DFLT -- DejaVu puts its real kern and
         /// liga lookups under `latn` and only a stub under DFLT.
@@ -2369,10 +2369,10 @@ pub const Font = struct {
 
 /// Format 4: segment mapping to delta values.
 ///
-/// KNOWN DIVERGENCE FROM stb_truetype, in GlyfZ's favour. The spec applies
+/// KNOWN DIVERGENCE FROM stb_truetype, in Inkwell's favour. The spec applies
 /// `idDelta` to the value fetched through `idRangeOffset`; stb returns the
 /// fetched value unchanged. On a font that combines a non-zero delta with a
-/// non-zero range offset the two disagree, and GlyfZ is the one following the
+/// non-zero range offset the two disagree, and Inkwell is the one following the
 /// spec. A differential run reports that as a mismatch only if a font in test
 /// uses the combination; the synthetic test below pins our behaviour either way.
 fn cmapFormat4(cm: []const u8, base: usize, cp: u21) GlyphError!u16 {
@@ -2621,7 +2621,7 @@ fn decodeSimple(data: []const u8, n_contours: usize, cur: *Cursor) GlyphError!vo
 ///
 /// SECOND KNOWN DIVERGENCE FROM stb_truetype. The spec applies the 2x2 matrix
 /// as given; stb additionally multiplies by the sqrt of each column's norm
-/// (`m = sqrt(a*a + b*b)`), which squares a uniform scale. GlyfZ follows the
+/// (`m = sqrt(a*a + b*b)`), which squares a uniform scale. Inkwell follows the
 /// spec. The two agree on the common case -- accents placed by translation
 /// with no matrix -- and disagree on scaled composites, which is exactly the
 /// kind of thing the differential is there to point at.
@@ -3071,7 +3071,7 @@ pub const Mask = struct {
 /// Glyph masks kept between draws, so a repeated glyph costs a lookup instead
 /// of a rasterisation.
 ///
-/// All of its memory is one caller-owned buffer. GlyfZ still does not allocate:
+/// All of its memory is one caller-owned buffer. Inkwell still does not allocate:
 /// the caller decides the size once, from `needed()`, and this carves that into
 /// the slot table, the outline scratch and the pixel arena.
 ///
@@ -5480,10 +5480,10 @@ test "a name record decodes from UTF-16 big endian" {
         // zig fmt: off
         .id = @intFromEnum(NameId.family),
         // zig fmt: on
-        .body = utf16be(&sbuf, "GlyfZ Sans"),
+        .body = utf16be(&sbuf, "Inkwell Sans"),
     }});
     var out: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("GlyfZ Sans", nameRecord(tbl, 1, &out).?);
+    try std.testing.expectEqualStrings("Inkwell Sans", nameRecord(tbl, 1, &out).?);
 }
 
 test "Microsoft Unicode beats Mac Roman for the same name id" {
@@ -5531,10 +5531,10 @@ test "a name truncated by a small buffer stops at a codepoint boundary" {
         .plat = 3,
         .enc = 1,
         .id = 1,
-        .body = utf16be(&sbuf, "GlyfZ"),
+        .body = utf16be(&sbuf, "Inkwell"),
     }});
     var small: [3]u8 = undefined;
-    try std.testing.expectEqualStrings("Gly", nameRecord(tbl, 1, &small).?);
+    try std.testing.expectEqualStrings("Ink", nameRecord(tbl, 1, &small).?);
     var empty: [0]u8 = undefined;
     try std.testing.expectEqualStrings("", nameRecord(tbl, 1, &empty).?);
 }

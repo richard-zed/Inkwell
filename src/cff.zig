@@ -1581,7 +1581,7 @@ pub fn flatten(segs: []const Segment, points: anytype, ends: anytype, tolerance:
     return .{ .points = points[0..np], .ends = ends[0..ne] };
 }
 
-/// The point type the outline conversion produces. Mirrors glyfz.Point so the
+/// The point type the outline conversion produces. Mirrors inkwell.Point so the
 /// two can be handed to the same rasteriser.
 pub const Point = struct { x: i32, y: i32, on: bool };
 

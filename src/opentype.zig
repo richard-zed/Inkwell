@@ -15,7 +15,7 @@ const std = @import("std");
 
 pub const Error = error{ Truncated, MissingTable, BufferTooSmall };
 
-/// Big-endian four-character tag, the same encoding `glyfz.tag` produces.
+/// Big-endian four-character tag, the same encoding `inkwell.tag` produces.
 pub fn tag(comptime s: *const [4]u8) u32 {
     return std.mem.readInt(u32, s, .big);
 }
@@ -1876,7 +1876,7 @@ test "a buffer shorter than the run is refused, not written past" {
     try testing.expectError(error.Truncated, l.adjustSingles(tag("DFLT"), 0, tag("palt"), &gids, gids.len, &out));
 }
 
-test "tag is big-endian, the same as glyfz's" {
+test "tag is big-endian, the same as inkwell's" {
     try testing.expectEqual(@as(u32, 0x6B65_726E), tag("kern"));
     try testing.expectEqual(@as(u32, 0x4446_4C54), tag("DFLT"));
 }

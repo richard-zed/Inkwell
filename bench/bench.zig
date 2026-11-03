@@ -1,4 +1,4 @@
-//! GlyfZ per glyph, as a call site actually pays for it.
+//! Inkwell per glyph, as a call site actually pays for it.
 //!
 //! Three numbers per size over the same glyph set: a rasterisation into
 //! caller-owned buffers, the decode-and-flatten half of it (so the gap is the
@@ -8,7 +8,7 @@
 //! ReleaseFast only. Debug numbers are ~10x worse and mean nothing here.
 
 const std = @import("std");
-const glyfz = @import("glyfz");
+const inkwell = @import("inkwell");
 
 fn readFont(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -17,7 +17,7 @@ fn readFont(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
 }
 
 fn fontPath() ![]const u8 {
-    const p = std.c.getenv("GLYFZ_BENCH_FONT") orelse return error.NoFont;
+    const p = std.c.getenv("INKWELL_BENCH_FONT") orelse return error.NoFont;
     return std.mem.span(p);
 }
 
@@ -28,13 +28,13 @@ pub fn main() !void {
     const gpa = std.heap.page_allocator;
 
     const path = fontPath() catch {
-        std.debug.print("set GLYFZ_BENCH_FONT to a TTF\n", .{});
+        std.debug.print("set INKWELL_BENCH_FONT to a TTF\n", .{});
         return error.NoFont;
     };
     const data = try readFont(gpa, path);
     defer gpa.free(data);
 
-    const font = try glyfz.Font.init(data);
+    const font = try inkwell.Font.init(data);
 
     // The glyphs a text run actually touches: printable ASCII through the font's
     // own cmap, so this is the mix a UI draws rather than a hand-picked best case.
@@ -48,9 +48,9 @@ pub fn main() !void {
         n += 1;
     }
 
-    var pts: [8192]glyfz.Point = undefined;
+    var pts: [8192]inkwell.Point = undefined;
     var ends: [512]u16 = undefined;
-    var edges: [8192]glyfz.Edge = undefined;
+    var edges: [8192]inkwell.Edge = undefined;
     var scratch: [1024]f32 = undefined;
     var cov: [256 * 256]u8 = undefined;
 
@@ -58,7 +58,7 @@ pub fn main() !void {
 
     // The cache never allocates: one caller-owned buffer, carved internally.
     var cbuf: [1 << 21]u8 align(8) = undefined;
-    var cache = try glyfz.Cache.init(&cbuf, .{ .arena = 1 << 20 });
+    var cache = try inkwell.Cache.init(&cbuf, .{ .arena = 1 << 20 });
 
     std.debug.print("{d} glyphs from printable ASCII, {d} units per em\n\n", .{ n, font.units_per_em });
     std.debug.print("{s:>6} {s:>11} {s:>11} {s:>11} {s:>9}\n", .{ "size", "raster ns", "decode ns", "cached ns", "raster/hit" });
@@ -132,7 +132,7 @@ pub fn main() !void {
     }
 
     var lbuf: [1 << 14]u8 align(8) = undefined;
-    var lookup = try glyfz.Lookup.init(&lbuf, .{});
+    var lookup = try inkwell.Lookup.init(&lbuf, .{});
 
     const look_reps: u32 = 500;
     var best_map: i128 = std.math.maxInt(i128);

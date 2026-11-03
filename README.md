@@ -1,4 +1,4 @@
-# GlyfZ
+# Inkwell
 
 A font decoder and glyph rasteriser for Zig 0.16 and 0.17: TrueType and CFF outlines,
 GSUB/GPOS shaping, variable-font instances, COLR colour. No allocator -- every
@@ -12,14 +12,14 @@ I'm using this for a UI library, didn't want to use the C dependency, kinda port
 
 ## Usage
 
-GlyfZ reads `glyf` and CFF-based fonts, turns outlines into antialiased
+Inkwell reads `glyf` and CFF-based fonts, turns outlines into antialiased
 coverage masks, and keeps those masks between draws. It shapes Arabic and Thai
 over GSUB and kerns from GPOS, but it has no fallback chain and no line breaking:
 those are the caller's job.
 
 ```zig
-var font = try glyfz.Font.init(bytes);           // bytes are yours
-var cache = try glyfz.Cache.init(&storage, .{}); // so is the cache's memory
+var font = try inkwell.Font.init(bytes);           // bytes are yours
+var cache = try inkwell.Cache.init(&storage, .{}); // so is the cache's memory
 const gid = try font.glyphIndex('A');
 const m = try cache.mask(font, gid, 16, .zero);  // a hash lookup once warm
 ```
@@ -33,7 +33,7 @@ Two properties are the whole point:
   outlines, edges, coverage, and the glyph cache -- is yours too. The claim is
   about who owns memory, not about using none.
 - **Glyph masks are cached.** `stbtt_GetCodepointBitmap` allocates, rasterises
-  and frees on every draw, per glyph. A GlyfZ cache hit is a hash lookup and a
+  and frees on every draw, per glyph. A Inkwell cache hit is a hash lookup and a
   slice into caller memory. What stays warm is the rasterised coverage, keyed on
   glyph, scale and subpixel phase -- not outlines, and not metrics.
 
@@ -181,7 +181,7 @@ Sans, run while stb was still vendored here:
 Those comparisons were shown to be capable of failing rather than assumed to
 pass: a one-unit box shift flagged 6190/6190, a half-pixel phase shift drove
 coverage delta to 169, and dropping the sweep's accumulator tail drove it to
-255. Agreement with stb proves GlyfZ is not *different*; it does not prove it is
+255. Agreement with stb proves Inkwell is not *different*; it does not prove it is
 *right*, which is why the spec settles arguments.
 
 ## Measured cost
@@ -190,7 +190,7 @@ Per glyph, ReleaseFast, 94 printable-ASCII glyphs, best of 40, three runs of the
 same binary (the spread is the honest precision). The stb column is from the
 same period as the differential above:
 
-| size | stb | glyfz raster | ratio | cache hit | vs stb |
+| size | stb | inkwell raster | ratio | cache hit | vs stb |
 |---|---|---|---|---|---|
 | 11 | 2100-2118 | 2048-2064 | 1.02-1.03x | 115-116 ns | 18x |
 | 16 | 1942-2134 | 1983-2212 | 0.96-1.03x | 86-94 ns | 22-25x |
@@ -239,7 +239,7 @@ zig build fuzz  -Dfont=/path/to/font.ttf      # malformed input: rejected, never
 ```
 
 No font is vendored, so `bench` and `fuzz` both need `-Dfont=` (or
-`GLYFZ_BENCH_FONT` / `GLYFZ_TEST_FONT`). Aim them at an awkward face on purpose.
+`INKWELL_BENCH_FONT` / `INKWELL_TEST_FONT`). Aim them at an awkward face on purpose.
 
 ## Profiles
 
@@ -257,11 +257,11 @@ those modules from the full build. What the minimal line buys is fewer types,
 not a smaller binary.
 
 ```zon
-.glyfz = .{
+.inkwell = .{
     // full
-    .url = "git+https://github.com/richard-zed/glyfz?ref=Zig-0.16",
+    .url = "git+https://github.com/richard-zed/inkwell?ref=Zig-0.16",
     // minimal
-    // .url = "git+https://github.com/richard-zed/glyfz?ref=v0.2.1-zig0.17",
+    // .url = "git+https://github.com/richard-zed/inkwell?ref=v0.2.1-zig0.17",
     .hash = "...",
 },
 ```
@@ -320,7 +320,7 @@ number of glyph-scale pairs you expect hot.
   not be caught by the suite.
 - **The one consumer pins a commit.** A Zig GUI toolkit links this at a specific
   revision rather than by version range, so an API change here reaches it only
-  when that pin is moved on purpose. Nothing else consumes GlyfZ.
+  when that pin is moved on purpose. Nothing else consumes Inkwell.
 
 - **No bitmap or compressed container.** CBDT/CBLC and `sbix` are not read, so
   a colour-emoji face in its usual format renders nothing; COLR v0 works, and a

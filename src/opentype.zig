@@ -2958,6 +2958,30 @@ test "contextual format 3 matches through coverage lists" {
     try testing.expectEqual(@as(u16, 50), miss[0]);
 }
 
+test "contextual format 3 matches away from position zero" {
+    // Every other format 3 test parks the match at 0, where a coverage index
+    // and an absolute buffer position are the same number. Park it at 1 and
+    // read the coverage at the right glyph or not at all: the record has to
+    // pick up buf[pos], not buf[0].
+    var b = Builder.init();
+    gsubContextFormat3(&b);
+    const l = try Layout.init(b.bytes(), 0, @intCast(b.len));
+
+    var buf = [_]u16{ 77, 50, 51 };
+    _ = try l.applyFeature(tag("DFLT"), 0, tag("liga"), &buf, 3);
+    try testing.expectEqual(@as(u16, 77), buf[0]); // prefix untouched
+    try testing.expectEqual(@as(u16, 55), buf[1]); // 50 -> 55 at pos 1
+    try testing.expectEqual(@as(u16, 51), buf[2]); // lookahead untouched
+
+    // Same prefix, with the lookahead broken. A reader that began its input
+    // at index 0 would see 77 and simply miss, which is indistinguishable
+    // from the correct answer -- which is exactly why the positive case
+    // above is the one that matters.
+    var miss = [_]u16{ 77, 50, 99 };
+    _ = try l.applyFeature(tag("DFLT"), 0, tag("liga"), &miss, 3);
+    try testing.expectEqual(@as(u16, 50), miss[1]);
+}
+
 test "contextual format 1 matches a sequence and substitutes through it" {
     var b = Builder.init();
     gsubContextFormats(&b);

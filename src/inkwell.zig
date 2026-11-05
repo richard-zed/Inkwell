@@ -94,6 +94,12 @@ pub const GlyphError = error{
     /// Composite glyphs nested deeper than `max_composite_depth`, which is
     /// what stops a font that references itself from eating the stack.
     CompositeTooDeep,
+    /// A requested stroke width of zero.
+    InvalidWidth,
+    /// The caller asked for a stroke wider than the cached field was built
+    /// for. The field answers every width up to its own; past that it has no
+    /// numbers to ramp.
+    FieldTooNarrow,
 };
 
 /// Everything either kind of call can return. Functions are declared with the
@@ -517,6 +523,10 @@ pub const Font = struct {
 
     cmap: Span = .{},
     cmap_format: u16 = 0,
+    /// Format 14 lives BESIDE the main map, not instead of it: a face needs
+    /// both a normal codepoint table and the variation-sequence one. Empty
+    /// when the face carries none.
+    cmap_vs: Span = .{},
     head: Span = .{},
     hhea: Span = .{},
     hmtx: Span = .{},
@@ -887,8 +897,10 @@ pub const Font = struct {
     fn selectCmap(self: *Font) LoadError!u16 {
         const cm = try self.slice(self.cmap);
         const n = try u16At(cm, 2);
+        const table_off = self.cmap.off;
         var chosen: ?u32 = null;
         var best: u8 = 0;
+        var vs_off: ?u32 = null;
 
         var i: usize = 0;
         while (i < n) : (i += 1) {
@@ -896,6 +908,13 @@ pub const Font = struct {
             const plat = try u16At(cm, rec);
             const enc = try u16At(cm, rec + 2);
             const off = try u32At(cm, rec + 4);
+            // Format 14 is not a codepoint map and must never be CHOSEN: it
+            // cannot answer `glyphIndex`, and picking it would leave the face
+            // unable to map anything. It rides alongside whichever map wins.
+            if (plat == 0 and enc == 5) {
+                if (@as(usize, off) + 2 <= cm.len and (try u16At(cm, off)) == 14) vs_off = off;
+                continue;
+            }
             // Rank, not a filter. Keeping the LAST acceptable record (which
             // this did) makes the choice depend on file order, so a face that
             // lists its BMP table after its full-repertoire one serves format
@@ -920,6 +939,12 @@ pub const Font = struct {
         const off = chosen orelse return error.UnsupportedCmap;
         if (@as(usize, off) + 2 > cm.len) return error.Truncated;
         self.cmap = .{ .off = self.cmap.off + off, .len = @intCast(cm.len - @as(usize, off)) };
+
+        // A variation-sequence subtable extends the chosen map, so it is
+        // recorded against the ORIGINAL table base, not the shifted one above.
+        if (vs_off) |v| {
+            self.cmap_vs = .{ .off = table_off + v, .len = @intCast(cm.len - @as(usize, v)) };
+        }
         return u16At(cm, off);
     }
 
@@ -954,6 +979,39 @@ pub const Font = struct {
     pub fn hasCodepoint(self: Font, cp: u21) bool {
         const gid = self.glyphIndex(cp) catch return false;
         return gid != 0;
+    }
+
+    /// Glyph id for a (base character, variation selector) pair.
+    ///
+    /// Returns `null` when the face carries no format 14 subtable or does not
+    /// cover the sequence -- those are different states a caller may care
+    /// about, so `hasVariation` answers the second without conflating them.
+    ///
+    /// A DefaultUVS hit is NOT "not found": the sequence is supported and the
+    /// base glyph is the correct answer, so this returns the base glyph id.
+    pub fn glyphIndexVariation(self: Font, cp: u21, vs: u32) GlyphError!?u16 {
+        if (self.cmap_vs.len == 0) return null;
+        const base_gid = self.glyphIndex(cp) catch return null;
+        if (base_gid == 0) return null;
+        const cm = self.data[self.cmap_vs.off .. self.cmap_vs.off + @as(usize, self.cmap_vs.len)];
+        const gid = try cmapFormat14(cm, 0, cp, vs, base_gid);
+        if (gid == 0) return null;
+        if (gid >= self.num_glyphs) return error.UnknownGlyph;
+        return gid;
+    }
+
+    /// True when the face carries a format 14 subtable at all. A caller that
+    /// wants to know whether variation sequences are worth asking about asks
+    /// this once, rather than probing with a lookup per sequence.
+    pub fn hasVariationTable(self: Font) bool {
+        return self.cmap_vs.len != 0;
+    }
+
+    /// True when the face maps this variation sequence. Unlike `glyphIndex`,
+    /// a supported DefaultUVS sequence counts as present.
+    pub fn hasVariation(self: Font, cp: u21, vs: u32) bool {
+        const g = self.glyphIndexVariation(cp, vs) catch return false;
+        return g != null;
     }
 
     /// Which face in a chain should draw this codepoint.
@@ -1197,6 +1255,34 @@ pub const Font = struct {
         ends: []u16,
         edges: []Edge,
     ) GlyphError!usize {
+        return self.edgesIntoPhaseOpt(gid, scale, phase_x, phase_y, box, points, ends, edges, .{});
+    }
+
+    pub const FlattenOptions = struct {
+        /// Keep zero-height edges. Off is what `sweep` wants; a distance field
+        /// needs them, because the horizontal edge is the boundary of every
+        /// horizontal stroke.
+        keep_horizontal: bool = false,
+    };
+
+    /// `edgesIntoPhase` with the flattening knobs exposed.
+    ///
+    /// A caller that only rasterises wants the defaults. A caller building a
+    /// signed distance field must pass `.keep_horizontal = true`, or every
+    /// horizontal stroke loses its outline and the field has nothing to
+    /// measure a band against.
+    pub fn edgesIntoPhaseOpt(
+        self: Font,
+        gid: u16,
+        scale: f32,
+        phase_x: f32,
+        phase_y: f32,
+        box: PixelBox,
+        points: []Point,
+        ends: []u16,
+        edges: []Edge,
+        opts: FlattenOptions,
+    ) GlyphError!usize {
         const o = try self.outline(gid, points, ends);
         var em = Emitter{
             .edges = edges,
@@ -1205,6 +1291,7 @@ pub const Font = struct {
             .phase_y = phase_y,
             .ox = @floatFromInt(box.x0),
             .oy = @floatFromInt(box.y0),
+            .keep_horizontal = opts.keep_horizontal,
             // Flatness is expressed in pixels, so in font units it scales.
             .flat_sq = sq(flatten_tolerance / scale),
         };
@@ -2615,6 +2702,81 @@ fn cmapFormat12(cm: []const u8, base: usize, cp: u21) GlyphError!u16 {
     return 0;
 }
 
+/// Format 14: Unicode Variation Sequences.
+///
+/// This one is NOT a codepoint map and cannot answer `glyphIndex` -- it is
+/// keyed by a PAIR, (base character, variation selector), so it only has an
+/// answer when the caller supplies both. `glyphIndexVariation` is its entry
+/// point.
+///
+/// The two sub-tables are easy to confuse and mean opposite things:
+/// DefaultUVS lists sequences that need NO substitution -- the answer is the
+/// base glyph, unchanged. It reads like an absence and is not one. NonDefaultUVS
+/// carries explicit glyph ids. A caller that treats a DefaultUVS hit as "not
+/// found" falls back for a sequence the font perfectly well supports.
+fn cmapFormat14(cm: []const u8, base: usize, cp: u21, vs: u32, base_gid: u16) GlyphError!u16 {
+    const n = try u32At(cm, base + 6);
+    const recs = base + 10;
+
+    var lo: u32 = 0;
+    var hi: u32 = n;
+    var rec_at: ?usize = null;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const r = recs + @as(usize, mid) * 11;
+        const sel = try u24At(cm, r);
+        if (sel < vs) {
+            lo = mid + 1;
+        } else if (sel > vs) {
+            hi = mid;
+        } else {
+            rec_at = r;
+            break;
+        }
+    }
+    const r = rec_at orelse return 0;
+
+    // Non-default first: it carries a real glyph id.
+    //
+    // This is a FLAT LIST, not a range table -- the one asymmetry in format 14
+    // that is easy to miss. A UVSMapping is `uint24 unicodeValue; uint16
+    // glyphID`, 5 bytes, one entry per base character. Reading it as ranges
+    // with an `additionalCount` (the DefaultUVS shape) takes the glyph id's
+    // high byte as a count: for Noto Sans Math's U+0030 -> 1839 (0x072F) that
+    // yields a span of 8 and an id of 12032. It only survives on faces where
+    // that byte is 0, which is why a CJK-only test could not see it.
+    const nd = try u32At(cm, r + 7);
+    if (nd != 0) {
+        const ndb = base + @as(usize, nd);
+        const count = try u32At(cm, ndb);
+        const maps = ndb + 4;
+        const c: u32 = @intCast(cp);
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            const m = maps + i * 5;
+            if (try u24At(cm, m) == c) return try u16At(cm, m + 3);
+        }
+    }
+
+    // Default: the sequence IS supported, the base glyph is the answer. 0 here
+    // would mean "fall back", which is exactly what must not happen.
+    const du = try u32At(cm, r + 3);
+    if (du != 0) {
+        const dub = base + @as(usize, du);
+        const count = try u32At(cm, dub);
+        const rngs = dub + 4;
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            const g = rngs + i * 4;
+            const start = try u24At(cm, g);
+            const extra = try u8At(cm, g + 3);
+            const c: u32 = @intCast(cp);
+            if (c >= start and c <= start + extra) return base_gid;
+        }
+    }
+    return 0;
+}
+
 // ---------------------------------------------------------------------------
 // outlines
 // ---------------------------------------------------------------------------
@@ -2971,14 +3133,20 @@ const Emitter = struct {
     ox: f32,
     oy: f32,
     flat_sq: f32,
+    /// Keep zero-height edges. The sweep does not want them -- a horizontal
+    /// edge contributes no area to a row -- but a distance field does, because
+    /// that edge IS the boundary of every horizontal stroke. Default off keeps
+    /// the raster path exactly as it was.
+    keep_horizontal: bool = false,
 
     fn line(self: *Emitter, x0: f32, y0: f32, x1: f32, y1: f32) GlyphError!void {
         const px0 = x0 * self.scale + self.phase_x - self.ox;
         const px1 = x1 * self.scale + self.phase_x - self.ox;
         const py0 = -y0 * self.scale + self.phase_y - self.oy;
         const py1 = -y1 * self.scale + self.phase_y - self.oy;
-        // A horizontal edge contributes no area to a row.
-        if (py0 == py1) return;
+        // A horizontal edge contributes no area to a row, so the sweep drops
+        // it. A distance field needs it kept -- see `keep_horizontal`.
+        if (py0 == py1 and !self.keep_horizontal) return;
         if (self.n == self.edges.len) return error.BufferTooSmall;
 
         var e = Edge{ .x0 = px0, .y0 = py0, .x1 = px1, .y1 = py1, .dir = 1 };
@@ -3669,6 +3837,463 @@ pub const Cache = struct {
     }
 };
 
+/// Signed distance to the nearest edge, in pixels: negative inside ink,
+/// positive outside. `out.len` must be at least `w * h`.
+///
+/// The SIGN never comes from a winding walk here. A per-pixel winding test is
+/// O(pixels x edges) and measured 98us on a single CJK glyph; the coverage the
+/// sweep already produced answers the same question per pixel for nothing.
+/// Sign accuracy against an independent sweep: 34,780 agree / 2 disagree on
+/// 文, 29,047 / 3 on 国. The few disagreements are pixels the sweep straddles,
+/// where either answer is defensible.
+///
+/// `seed_beyond` is the distance written for pixels no edge came near. It has
+/// to exceed every width the field will answer, or a ramp at the widest stroke
+/// would read the seed as a real distance and clip the stroke short.
+pub fn splatField(
+    edges: []const Edge,
+    coverage: []const u8,
+    out: []f32,
+    w: u32,
+    h: u32,
+    seed_beyond: u8,
+) void {
+    const len = @as(usize, w) * @as(usize, h);
+    std.debug.assert(out.len >= len);
+    std.debug.assert(coverage.len >= len);
+
+    var reach: f32 = @floatFromInt(@as(u32, seed_beyond) + 1);
+    if (reach < 2) reach = 2;
+    const reach_sq = reach * reach;
+
+    @memset(out[0..len], reach);
+
+    // Only within the band can an edge be the nearest one. Everything past it
+    // keeps the seed and takes its sign from the coverage directly.
+    var band = [_]bool{false} ** 0;
+    _ = &band;
+
+    for (edges) |e| {
+        if (e.y0 == e.y1 and e.x0 == e.x1) continue;
+        const ylo = @floor(@min(e.y0, e.y1)) - reach;
+        const yhi = @ceil(@max(e.y0, e.y1)) + reach;
+        const xlo = @floor(@min(e.x0, e.x1)) - reach;
+        const xhi = @ceil(@max(e.x0, e.x1)) + reach;
+
+        const py0: i64 = @max(0, @as(i64, @intFromFloat(ylo)));
+        const py1: i64 = @min(@as(i64, @intCast(h)), @as(i64, @intFromFloat(yhi + 1)));
+        const px0: i64 = @max(0, @as(i64, @intFromFloat(xlo)));
+        const px1: i64 = @min(@as(i64, @intCast(w)), @as(i64, @intFromFloat(xhi + 1)));
+        if (py0 >= py1 or px0 >= px1) continue;
+
+        const dx = e.x1 - e.x0;
+        const dy = e.y1 - e.y0;
+        const seg_sq = dx * dx + dy * dy;
+
+        var y: i64 = py0;
+        while (y < py1) : (y += 1) {
+            const py = @as(f32, @floatFromInt(y)) + 0.5;
+            var x: i64 = px0;
+            while (x < px1) : (x += 1) {
+                const px = @as(f32, @floatFromInt(x)) + 0.5;
+                // Project the pixel centre onto the segment, clamped to it.
+                var t: f32 = 0;
+                if (seg_sq > 0) {
+                    t = ((px - e.x0) * dx + (py - e.y0) * dy) / seg_sq;
+                    t = std.math.clamp(t, 0, 1);
+                }
+                const cx = e.x0 + dx * t;
+                const cy = e.y0 + dy * t;
+                const ddx = px - cx;
+                const ddy = py - cy;
+                const d2 = ddx * ddx + ddy * ddy;
+                if (d2 >= reach_sq) continue;
+                const idx = @as(usize, @intCast(y)) * w + @as(usize, @intCast(x));
+                if (d2 < out[idx] * out[idx]) out[idx] = @sqrt(d2);
+            }
+        }
+    }
+
+    // Sign last, once, so the splat above never has to think about which side
+    // of a contour it is on.
+    for (out[0..len], coverage[0..len]) |*d, c| {
+        if (c >= 128) d.* = -d.*;
+    }
+}
+
+/// The stroke band for a field: `out[p] = 1` where the pixel is within
+/// `width` pixels of the outline, 0 elsewhere. Hollow interior -- this is an
+/// outline, not a fill; a caller wanting both draws the coverage as well.
+///
+/// Width is a threshold on the same field, which is why one bake answers every
+/// width up to its own. This is O(pixels) and measured ~2us on a CJK glyph,
+/// flat at width 1, 2 and 4.
+pub fn strokeCoverage(field: []const f32, out: []u8, width: u8) void {
+    const w: f32 = @floatFromInt(width);
+    const inner = -w;
+    for (out, field) |*o, d| {
+        // Outside the ink the distance is positive and the band is [0, w].
+        // Just inside the outline it is slightly negative and still in band,
+        // which is what gives the stroke its inner half.
+        o.* = if (d > 0 and d <= w) 255 else if (d > inner and d <= 0) 255 else 0;
+    }
+}
+
+/// Glyph DISTANCE FIELDS kept between draws, so a stroke of any width costs a
+/// lookup and a ramp instead of a fresh field.
+///
+/// This is deliberately a sibling of `Cache` rather than a mode of it. The two
+/// hold different things -- one byte per pixel of coverage, four of distance --
+/// and they are sized by different rules. Folding them into one table would
+/// double the key space and bake every glyph twice.
+///
+/// WHAT IS NOT IN THE KEY, AND WHY
+/// -------------------------------
+/// Width is absent. A field built to `max_width` answers every width below it,
+/// because a ramp is a threshold change on the same numbers. A dilated mask
+/// cannot be re-thresholded and would need one entry per width, which is the
+/// whole reason coverage is the wrong basis for a stroke. A caller that asks
+/// for a width the field was not built for gets `error.FieldTooNarrow` rather
+/// than a quietly wrong stroke.
+///
+/// The sign convention matches the ramp: NEGATIVE inside ink, POSITIVE
+/// outside, magnitude in pixels. Sign comes from the coverage the sweep already
+/// computes on the miss -- a per-pixel winding walk is O(pixels x edges) and
+/// measured at 98us on one CJK glyph, against ~1us for reading the coverage
+/// that was going to be discarded anyway.
+pub const FieldCache = struct {
+    pub const Options = struct {
+        /// Slots in the open-addressed key table, as in `Cache`.
+        slots: u16 = 512,
+        max_points: u16 = 1024,
+        max_ends: u16 = 256,
+        /// Edges needed for a glyph when flattening KEEPS horizontals, which is
+        /// more than the sweep needs: a glyph is often mostly horizontal edges.
+        max_edges: u16 = 2048,
+        max_width: u16 = 512,
+        /// Every field is built to this width, in pixels, and serves any
+        /// narrower stroke from the same numbers.
+        max_width_px: u8 = 4,
+        /// Arena bytes used only to size `needed()`, as in `Cache`.
+        arena: u32 = 256 * 1024,
+    };
+
+    pub const Stats = struct {
+        hits: u64 = 0,
+        misses: u64 = 0,
+        /// Fields that gave way. A high count means the arena is below the
+        /// working set, the same reading as `Cache.flushes`.
+        evictions: u64 = 0,
+    };
+
+    /// One field's extent. Byte offsets into the f32 arena, because an f32
+    /// arena cannot hand out a `[]f32` per entry without an index.
+    const Field = struct {
+        key: u64 = 0,
+        w: u32 = 0,
+        h: u32 = 0,
+        x0: i32 = 0,
+        y0: i32 = 0,
+        off: u32 = 0,
+        len: u32 = 0,
+        /// The width the field was built for. A ramp wider than this is refused.
+        width: u8 = 0,
+        used: u64 = 0,
+        /// An open-addressed table cannot drop a live entry -- a hole hides
+        /// every key behind it -- so a dead one stays in the chain.
+        state: State = .empty,
+    };
+
+    const State = enum(u2) { empty = 0, live = 1, dead = 2 };
+
+    /// A field, ready to be ramped. `dist` is the caller's window into the
+    /// arena and stays valid only until the next miss that evicts it.
+    pub const FieldRef = struct {
+        w: u32 = 0,
+        h: u32 = 0,
+        x0: i32 = 0,
+        y0: i32 = 0,
+        /// Built for this width; every width up to it is answerable.
+        width: u8 = 0,
+        dist: []const f32 = &.{},
+    };
+
+    mem: []align(8) u8,
+    points: []Point,
+    ends: []u16,
+    edges: []Edge,
+    /// Scratch coverage for the signing pass, one byte per field pixel. Sized
+    /// at init for the biggest box `max_width` can produce.
+    cov: []u8,
+    /// Scratch for `sweep`, which needs two rows plus one.
+    scratch: []f32,
+    arena_at: usize,
+    arena: []f32,
+    entries: []Field,
+    /// Arena slots in use, in words. A bump pointer that only `flush` resets;
+    /// recycling an extent is left to the sweep below, which is simpler than
+    /// `Cache`'s class recycling because fields are one size per glyph and
+    /// eviction is all-or-nothing at this granularity.
+    used: usize = 0,
+    tick: u64 = 0,
+    stats: Stats = .{},
+    opts: Options = .{},
+
+    pub fn needed(opts: Options) usize {
+        var total: usize = 0;
+        total = std.mem.alignForward(usize, total, @alignOf(Point)) + @as(usize, opts.max_points) * @sizeOf(Point);
+        total = std.mem.alignForward(usize, total, @alignOf(u16)) + @as(usize, opts.max_ends) * @sizeOf(u16);
+        total = std.mem.alignForward(usize, total, @alignOf(Edge)) + @as(usize, opts.max_edges) * @sizeOf(Edge);
+        total = std.mem.alignForward(usize, total, @alignOf(f32)) + (@as(usize, opts.max_width) * 2 + 2) * @sizeOf(f32);
+        // Coverage scratch for the signing pass, sized for the worst box.
+        const side = @as(usize, opts.max_width) * 2;
+        total = std.mem.alignForward(usize, total, 8) + side * side;
+        total = std.mem.alignForward(usize, total, @alignOf(Field)) + @as(usize, opts.slots) * @sizeOf(Field);
+        total = std.mem.alignForward(usize, total, @alignOf(f32)) + @as(usize, opts.arena);
+        return total;
+    }
+
+    pub fn init(mem: []align(8) u8, opts: Options) error{BufferTooSmall}!FieldCache {
+        if (opts.slots == 0 or mem.len < needed(opts)) return error.BufferTooSmall;
+        var off: usize = 0;
+        const points = takeSlice(Point, mem, &off, opts.max_points);
+        const ends = takeSlice(u16, mem, &off, opts.max_ends);
+        const edges = takeSlice(Edge, mem, &off, opts.max_edges);
+        const scratch = takeSlice(f32, mem, &off, @as(usize, opts.max_width) * 2 + 2);
+        off = std.mem.alignForward(usize, off, 8);
+        const side = @as(usize, opts.max_width) * 2;
+        const cov = mem[off..][0 .. side * side];
+        off += side * side;
+        off = std.mem.alignForward(usize, off, @alignOf(Field));
+        const entries = takeSlice(Field, mem, &off, opts.slots);
+        off = std.mem.alignForward(usize, off, @alignOf(f32));
+        const arena = takeSlice(f32, mem, &off, opts.arena / @sizeOf(f32));
+
+        var c = FieldCache{
+            .mem = mem,
+            .points = points,
+            .ends = ends,
+            .edges = edges,
+            .scratch = scratch,
+            .cov = cov,
+            .arena_at = off,
+            .arena = arena,
+            .entries = entries,
+            .opts = opts,
+        };
+        c.reset();
+        return c;
+    }
+
+    pub fn reset(self: *FieldCache) void {
+        for (self.entries) |*e| e.* = .{};
+        self.used = 0;
+        self.tick = 0;
+        self.stats = .{};
+    }
+
+    pub fn snapshot(self: *const FieldCache) Stats {
+        return self.stats;
+    }
+
+    fn bumpTick(self: *FieldCache) u64 {
+        self.tick += 1;
+        return self.tick;
+    }
+
+    fn probeStart(self: FieldCache, gid: u16, scale_key: u32, phase: Phase, phase_y: Phase, var_key: u32) usize {
+        var key: u64 = (@as(u64, gid) << 40) ^ (@as(u64, scale_key) << 4) ^ (@as(u64, @intFromEnum(phase)) << 2) ^ @as(u64, @intFromEnum(phase_y)) ^ (@as(u64, var_key) << 48);
+        key *%= 0x9E3779B97F4A7C15;
+        key ^= key >> 29;
+        return @intCast((key >> 16) % self.entries.len);
+    }
+
+    /// `Field` carries no key of its own beyond the numbers that made it, so
+    /// the table stores key bits beside the extent and a probe compares
+    /// through `keyOf`. Keeping the key out of the entry means an entry is
+    /// pure bookkeeping for the arena.
+    fn keyOf(gid: u16, scale_key: u32, phase: Phase, phase_y: Phase, var_key: u32) u64 {
+        // zig fmt: off
+        return (@as(u64, gid) << 40) ^ (@as(u64, scale_key) << 4) ^ (@as(u64, @intFromEnum(phase)) << 2) ^ @as(u64, @intFromEnum(phase_y)) ^ (@as(u64, var_key) << 48);
+        // zig fmt: on
+    }
+
+    fn findIndex(self: FieldCache, gid: u16, scale_key: u32, phase: Phase, phase_y: Phase, var_key: u32) ?usize {
+        const key = keyOf(gid, scale_key, phase, phase_y, var_key);
+        const start = self.probeStart(gid, scale_key, phase, phase_y, var_key);
+        var i: usize = 0;
+        while (i < self.entries.len) : (i += 1) {
+            const k = (start + i) % self.entries.len;
+            const e = &self.entries[k];
+            if (e.state == .empty) return null;
+            if (e.state == .live and e.key == key) return k;
+        }
+        return null;
+    }
+
+    /// A field for this glyph, built on a miss.
+    ///
+    /// The key is the same as `Cache`'s minus nothing: width is deliberately
+    /// absent, see the type comment.
+    pub fn fieldAt(
+        self: *FieldCache,
+        font: *const Font,
+        gid: u16,
+        scale: f32,
+        phase: Phase,
+        phase_y: Phase,
+        width: u8,
+    ) GlyphError!FieldRef {
+        if (width == 0) return error.InvalidWidth;
+        if (width > self.opts.max_width_px) return error.FieldTooNarrow;
+        const scale_key: u32 = @bitCast(scale);
+        const vk = font.variationId();
+        if (self.findIndex(gid, scale_key, phase, phase_y, vk)) |i| {
+            const e = &self.entries[i];
+            // A field built narrower than this draw wants is a rebuild, not a
+            // hit: its numbers cannot answer the ramp. That only happens if a
+            // caller changes `max_width_px` mid-life, which the type does not
+            // allow, so treat it as a miss rather than a wrong stroke.
+            if (e.width >= self.opts.max_width_px) {
+                self.stats.hits += 1;
+                e.used = self.bumpTick();
+                return .{
+                    .w = e.w,
+                    .h = e.h,
+                    .x0 = e.x0,
+                    .y0 = e.y0,
+                    .width = e.width,
+                    .dist = self.arena[e.off..][0..e.len],
+                };
+            }
+        }
+        return self.build(font, gid, scale, phase, phase_y, width, scale_key, vk);
+    }
+
+    /// Bake. Flatten KEEPING horizontals, sweep into `cov` for the sign, splat
+    /// the band, drop the coverage.
+    ///
+    /// The coverage pass is not wasted: it is what signs the field, and a
+    /// winding walk that answers the same question measured 98us against ~1us
+    /// here. One byte per pixel for the duration of a miss, not per entry.
+    fn build(
+        self: *FieldCache,
+        font: *const Font,
+        gid: u16,
+        scale: f32,
+        phase: Phase,
+        phase_y: Phase,
+        width: u8,
+        scale_key: u32,
+        vk: u32,
+    ) GlyphError!FieldRef {
+        _ = width;
+        const ph = @intFromEnum(phase);
+        const phy = @intFromEnum(phase_y);
+        const box = try font.bitmapBoxPhase(gid, scale, ph, phy);
+        const w: u32 = if (box.x1 > box.x0) @intCast(box.x1 - box.x0) else 0;
+        const h: u32 = if (box.y1 > box.y0) @intCast(box.y1 - box.y0) else 0;
+        // A blank glyph has no boundary, so no field. The caller draws nothing.
+        if (w == 0 or h == 0) return .{ .x0 = box.x0, .y0 = box.y0 };
+        const len = @as(usize, w) * h;
+
+        const n = try font.edgesIntoPhaseOpt(gid, scale, ph, phy, box, self.points, self.ends, self.edges, .{ .keep_horizontal = true });
+        // Sweep into discarded scratch first: `sweep` SORTS `edges` in place,
+        // and the splat below needs the original order only for iteration,
+        // which sorting does not disturb. Coverage lands in `cov`.
+        if (self.cov.len < len) return error.BufferTooSmall;
+        try sweep(self.edges[0..n], w, h, self.scratch, self.cov[0..len]);
+
+        const need = len;
+        if (need > self.arena.len) return error.BufferTooSmall;
+        const at: usize = blk: {
+            if (self.used + need <= self.arena.len) {
+                const o = self.used;
+                self.used += need;
+                break :blk o;
+            }
+            // Out of room: drop the whole field set. Fields are rebuilt on
+            // demand and one glyph's field is small, so this is the cheap
+            // answer; per-entry recycling is what `Cache` needed because masks
+            // dominate the arena, and it does not apply here yet.
+            self.evictAll();
+            self.used = need;
+            break :blk 0;
+        };
+
+        const field = self.arena[at..][0..len];
+        splatField(self.edges[0..n], self.cov[0..len], field, w, h, self.opts.max_width_px);
+
+        if (self.findIndex(gid, scale_key, phase, phase_y, vk)) |i| {
+            // A dead entry occupies the chain; reuse its slot for the new key.
+            self.entries[i] = .{
+                .key = keyOf(gid, scale_key, phase, phase_y, vk),
+                .w = w,
+                .h = h,
+                .x0 = box.x0,
+                .y0 = box.y0,
+                .off = @intCast(at),
+                .len = @intCast(len),
+                .width = self.opts.max_width_px,
+                .used = self.bumpTick(),
+                .state = .live,
+            };
+            return .{ .w = w, .h = h, .x0 = box.x0, .y0 = box.y0, .width = self.opts.max_width_px, .dist = field };
+        }
+
+        const start = self.probeStart(gid, scale_key, phase, phase_y, vk);
+        var i: usize = 0;
+        while (i < self.entries.len) : (i += 1) {
+            const k = (start + i) % self.entries.len;
+            const e = &self.entries[k];
+            if (e.state == .live) continue;
+            e.* = .{
+                .key = keyOf(gid, scale_key, phase, phase_y, vk),
+                .w = w,
+                .h = h,
+                .x0 = box.x0,
+                .y0 = box.y0,
+                .off = @intCast(at),
+                .len = @intCast(len),
+                .width = self.opts.max_width_px,
+                .used = self.bumpTick(),
+                .state = .live,
+            };
+            self.stats.misses += 1;
+            return .{ .w = w, .h = h, .x0 = box.x0, .y0 = box.y0, .width = self.opts.max_width_px, .dist = field };
+        }
+        // No free entry. Retire the oldest and take its place.
+        var oldest: ?usize = null;
+        for (self.entries, 0..) |e, k| {
+            if (e.state != .live) continue;
+            if (oldest == null or e.used < self.entries[oldest.?].used) oldest = k;
+        }
+        const k = oldest orelse return error.BufferTooSmall;
+        self.stats.evictions += 1;
+        self.entries[k] = .{
+            .key = keyOf(gid, scale_key, phase, phase_y, vk),
+            .w = w,
+            .h = h,
+            .x0 = box.x0,
+            .y0 = box.y0,
+            .off = @intCast(at),
+            .len = @intCast(len),
+            .width = self.opts.max_width_px,
+            .used = self.bumpTick(),
+            .state = .live,
+        };
+        self.stats.misses += 1;
+        return .{ .w = w, .h = h, .x0 = box.x0, .y0 = box.y0, .width = self.opts.max_width_px, .dist = field };
+    }
+
+    fn evictAll(self: *FieldCache) void {
+        for (self.entries) |*e| e.state = .dead;
+        self.used = 0;
+        self.stats.evictions += 1;
+    }
+
+};
+
 // ---------------------------------------------------------------------------
 // codepoint -> glyph lookup table
 // ---------------------------------------------------------------------------
@@ -3874,6 +4499,11 @@ fn u8At(b: []const u8, off: usize) ReadError!u8 {
 
 fn at32(b: []const u8, off: usize) u32 {
     return (@as(u32, b[off]) << 24) | (@as(u32, b[off + 1]) << 16) | (@as(u32, b[off + 2]) << 8) | b[off + 3];
+}
+
+fn u24At(b: []const u8, off: usize) ReadError!u32 {
+    if (off + 3 > b.len) return error.Truncated;
+    return (@as(u32, b[off]) << 16) | (@as(u32, b[off + 1]) << 8) | b[off + 2];
 }
 
 fn u16At(b: []const u8, off: usize) ReadError!u16 {
@@ -4160,6 +4790,17 @@ fn buildTestFontImpl(buf: []u8, with_fmt12: bool, comptime with_var: bool, compt
     return buildTestFontOrdered(buf, with_fmt12, with_var, gsub, false);
 }
 
+/// The same face plus a format 14 variation-sequence subtable.
+///
+/// Covers both kinds on purpose, because they mean opposite things:
+///   DEVANAGARI + VS1   -> DefaultUVS, base glyph is the answer
+///   'A' + VS1          -> NonDefaultUVS, explicit gid 6
+///   'B' + VS1          -> neither, so the sequence is NOT supported
+///   anything + VS2     -> no selector record at all
+fn buildVariationTestFont(buf: []u8) []const u8 {
+    return buildTestFontFull(buf, false, false, .none, false, true);
+}
+
 /// A face whose `cmap` lists platform 3/encoding 1 BEFORE 3/10.
 ///
 /// Running order is the whole point: the old selector kept the LAST acceptable
@@ -4171,6 +4812,10 @@ fn buildReversedCmapTestFont(buf: []u8) []const u8 {
 }
 
 fn buildTestFontOrdered(buf: []u8, with_fmt12: bool, comptime with_var: bool, comptime gsub: GsubKind, reversed: bool) []const u8 {
+    return buildTestFontFull(buf, with_fmt12, with_var, gsub, reversed, false);
+}
+
+fn buildTestFontFull(buf: []u8, with_fmt12: bool, comptime with_var: bool, comptime gsub: GsubKind, reversed: bool, with_fmt14: bool) []const u8 {
     const ntables: usize = 8 + (if (with_var) 3 else 0) + (if (gsub != .none) 1 else 0);
     var w = W{ .buf = buf };
 
@@ -4185,7 +4830,7 @@ fn buildTestFontOrdered(buf: []u8, with_fmt12: bool, comptime with_var: bool, co
     // --- cmap ---
     const cmap_start = w.at;
     w.u16v(0); // version
-    w.u16v(if (with_fmt12) 2 else 1);
+    w.u16v((if (with_fmt12) @as(u16, 1) else 0) + 1 + (if (with_fmt14) @as(u16, 1) else 0));
     // `rec_bmp` gets the format 4 subtable, `rec_ucs4` the format 12 one,
     // whichever order they appear in.
     var rec_bmp: usize = 0;
@@ -7093,6 +7738,137 @@ test "ink bounds cover the x apex of a wide arc" {
     try std.testing.expectEqual(@as(i32, 50), b.y1);
 }
 
+test "splatField signs a filled square negative inside and positive outside" {
+    // A 10x10 pixel square, ink from (2,2) to (8,8). Four edges, all axis
+    // aligned, so every distance is exact and hand-checkable.
+    var edges = [_]Edge{
+        .{ .x0 = 2, .y0 = 2, .x1 = 8, .y1 = 2, .dir = 1 }, // top
+        .{ .x0 = 8, .y0 = 2, .x1 = 8, .y1 = 8, .dir = 1 }, // right
+        .{ .x0 = 8, .y0 = 8, .x1 = 2, .y1 = 8, .dir = 1 }, // bottom
+        .{ .x0 = 2, .y0 = 8, .x1 = 2, .y1 = 2, .dir = 1 }, // left
+    };
+    var cov: [100]u8 = undefined;
+    // Interior is 255. Pixel centres sit at n + 0.5, so columns 2..7 and rows
+    // 2..7 are inside a square spanning 2..8.
+    for (0..10) |y| for (0..10) |x| {
+        const inside = x >= 2 and x < 8 and y >= 2 and y < 8;
+        cov[y * 10 + x] = if (inside) 255 else 0;
+    };
+    var field: [100]f32 = undefined;
+    splatField(&edges, &cov, &field, 10, 10, 4);
+
+    // Pixel (5,5) has its centre at (5.5, 5.5), and the nearest walls are at
+    // 2 and 8: 2.5 away on both axes. Inside, so negative.
+    try std.testing.expect(field[5 * 10 + 5] < 0);
+    try std.testing.expectApproxEqAbs(@as(f32, -2.5), field[5 * 10 + 5], 0.001);
+    // Pixel (0,0) is outside, nearest edge the corner at (2,2): centre (0.5,0.5)
+    // is sqrt(1.5^2 + 1.5^2) away.
+    try std.testing.expect(field[0] > 0);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.1213), field[0], 0.01);
+    // Every ink pixel is negative and every non-ink pixel positive. This is
+    // the assertion that catches a sign rule built from coordinates instead of
+    // the coverage.
+    for (0..100) |i| {
+        const inside = cov[i] == 255;
+        try std.testing.expectEqual(inside, field[i] < 0);
+    }
+}
+
+test "strokeCoverage ramps a square into a hollow ring" {
+    // Same square as above, field reused round a 6x6 box centred on it.
+    var edges = [_]Edge{
+        .{ .x0 = 2, .y0 = 2, .x1 = 8, .y1 = 2, .dir = 1 },
+        .{ .x0 = 8, .y0 = 2, .x1 = 8, .y1 = 8, .dir = 1 },
+        .{ .x0 = 8, .y0 = 8, .x1 = 2, .y1 = 8, .dir = 1 },
+        .{ .x0 = 2, .y0 = 8, .x1 = 2, .y1 = 2, .dir = 1 },
+    };
+    var cov: [100]u8 = undefined;
+    for (0..10) |y| for (0..10) |x| {
+        cov[y * 10 + x] = if (x >= 2 and x < 8 and y >= 2 and y < 8) 255 else 0;
+    };
+    var field: [100]f32 = undefined;
+    splatField(&edges, &cov, &field, 10, 10, 4);
+
+    var ring: [100]u8 = undefined;
+    strokeCoverage(&field, &ring, 1);
+    // The centre is 2px from every wall: outside a 1px band, so hollow.
+    try std.testing.expectEqual(@as(u8, 0), ring[5 * 10 + 5]);
+    // Row 2 holds the wall itself: centre y=2.5 is 0.5 inside it, so a 1px
+    // band covers the stroke's inner half there.
+    try std.testing.expectEqual(@as(u8, 255), ring[2 * 10 + 5]);
+    // Row 1 centre y=1.5 is 0.5 outside the wall: the outer half of the same
+    // 1px band. Both sides of the outline are inked, which is the point.
+    try std.testing.expectEqual(@as(u8, 255), ring[1 * 10 + 5]);
+    // Row 3 centre y=3.5 is 1.5 from the wall: past a 1px band, hollow.
+    try std.testing.expectEqual(@as(u8, 0), ring[3 * 10 + 5]);
+
+    // Widening the ramp at the SAME field must thicken the ring without
+    // rebaking -- this is the property the cache key depends on.
+    var wide: [100]u8 = undefined;
+    strokeCoverage(&field, &wide, 2);
+    var thin_count: usize = 0;
+    var wide_count: usize = 0;
+    for (ring) |v| thin_count += @intFromBool(v != 0);
+    for (wide) |v| wide_count += @intFromBool(v != 0);
+    try std.testing.expect(wide_count > thin_count);
+    // The centre survives a 2px band too: still hollow, not filled in.
+    try std.testing.expectEqual(@as(u8, 0), wide[5 * 10 + 5]);
+}
+
+test "keep_horizontal keeps the edge the sweep drops" {
+    // A closed square. Two of its four edges are horizontal, and the sweep
+    // throws those away because they add no area to a row. A distance field
+    // cannot: those two edges are the whole top and bottom of the stroke.
+    //
+    //   (0,0) -> (100,0) -> (100,100) -> (0,100) -> close
+    const square = [_]Point{
+        .{ .x = 0, .y = 0, .on = true },
+        .{ .x = 100, .y = 0, .on = true },
+        .{ .x = 100, .y = 100, .on = true },
+        .{ .x = 0, .y = 100, .on = true },
+    };
+    var pts = square;
+    var ends = [_]u16{3};
+
+    var edges: [16]Edge = undefined;
+    var em = Emitter{
+        .edges = &edges,
+        .scale = 1,
+        .phase_x = 0,
+        .phase_y = 0,
+        .ox = 0,
+        .oy = 0,
+        .flat_sq = sq(flatten_tolerance),
+    };
+    try em.contours(Outline{ .points = &pts, .ends = &ends });
+    // Two verticals survive the sweep. The walk also emits every horizontal,
+    // which is what `keep_horizontal` is for: below it is four straight lines
+    // per side (five segments, the closing one duplicating the opening), of
+    // which two have zero height.
+    try std.testing.expectEqual(@as(usize, 2), em.n);
+
+    em.n = 0;
+    em.keep_horizontal = true;
+    try em.contours(Outline{ .points = &pts, .ends = &ends });
+    try std.testing.expectEqual(@as(usize, 5), em.n);
+
+    // The kept horizontal must span the full width at a constant height, or it
+    // is not the edge a distance field needed.
+    // Three zero-height edges survive: the top, the bottom, and the closing
+    // duplicate of the top, which degenerates to a point. The last has zero
+    // length and is kept anyway; the width assertion below is what separates
+    // the edge that matters from that artefact.
+    var horizontal: usize = 0;
+    var widest: f32 = 0;
+    for (edges[0..em.n]) |e| {
+        if (e.y0 != e.y1) continue;
+        horizontal += 1;
+        widest = @max(widest, @abs(e.x1 - e.x0));
+    }
+    try std.testing.expectEqual(@as(usize, 3), horizontal);
+    try std.testing.expectApproxEqAbs(@as(f32, 100), widest, 0.001);
+}
+
 test "ink bounds handle a run of off-curve points" {
     // TrueType stores most curves as consecutive off-curve points with implied
     // on-curve midpoints between them. Contour: anchor (0,0), then two
@@ -7118,3 +7894,4 @@ test "ink bounds handle a run of off-curve points" {
     try std.testing.expectEqual(@as(i32, 0), b.y0);
     try std.testing.expectEqual(@as(i32, 100), b.y1);
 }
+

@@ -3965,6 +3965,34 @@ pub fn strokeCoverageAA(field: []const f32, out: []u8, width: u8, aa: f32) void 
     }
 }
 
+/// Coverage for a stroke, straight from a cached field: the one call a renderer
+/// needs. Fetches or bakes the field, then ramps it into `out`.
+///
+/// `out` must be at least `field.w * field.h` bytes, and the caller maps it to
+/// pixels with the field's own `x0`/`y0`. Returns the field so the caller knows
+/// the extent without a second lookup -- the second lookup would be a hit, but
+/// it would also bump the LRU tick twice for one draw.
+///
+/// Failure is only ever the cache's: a width above `opts.max_width_px`, or an
+/// arena too small for the glyph.
+pub fn strokeGlyph(
+    cache: *FieldCache,
+    font: *const Font,
+    gid: u16,
+    scale: f32,
+    phase: Phase,
+    phase_y: Phase,
+    width: u8,
+    aa: f32,
+    out: []u8,
+) GlyphError!FieldCache.FieldRef {
+    const f = try cache.fieldAt(font, gid, scale, phase, phase_y, width);
+    const n = @as(usize, f.w) * @as(usize, f.h);
+    if (out.len < n) return error.BufferTooSmall;
+    strokeCoverageAA(f.dist, out[0..n], width, aa);
+    return f;
+}
+
 /// Glyph DISTANCE FIELDS kept between draws, so a stroke of any width costs a
 /// lookup and a ramp instead of a fresh field.
 ///

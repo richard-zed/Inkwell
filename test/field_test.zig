@@ -136,3 +136,43 @@ test "a glyph field is signed and the cache reuses it" {
     try std.testing.expectEqual(@as(u64, 1), fc.snapshot().misses);
     try std.testing.expectEqualSlices(f32, a.dist, c.dist);
 }
+
+test "antialiased stroke on a real glyph keeps the band and softens it" {
+    const path = facePath("INKWELL_FACE") orelse return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+
+    const bytes = try readFile(gpa, path);
+    defer gpa.free(bytes);
+    const font = try Font.init(bytes);
+
+    const gid = try font.glyphIndex('o');
+
+    const opts: FieldCache.Options = .{};
+    const mem = try gpa.alignedAlloc(u8, .@"8", FieldCache.needed(opts));
+    defer gpa.free(mem);
+    var fc = try FieldCache.init(mem, opts);
+
+    const f = try fc.fieldAt(&font, gid, scale, .zero, .zero, 4);
+    const n = f.dist.len;
+    const hard = try gpa.alloc(u8, n);
+    defer gpa.free(hard);
+    const soft = try gpa.alloc(u8, n);
+    defer gpa.free(soft);
+
+    inkwell.strokeCoverage(f.dist, hard, 3);
+    inkwell.strokeCoverageAA(f.dist, soft, 3, 1.0);
+
+    var inked: usize = 0;
+    var partial: usize = 0;
+    for (hard, soft) |h, s| {
+        if (h != 0) inked += 1;
+        if (s != 0 and s != 255) partial += 1;
+        // aa never expands the band, only softens its boundaries.
+        if (h == 0) try std.testing.expect(s < 255);
+    }
+
+    // A stroke that inks nothing is the failure mode worth catching: it means
+    // the field lost the outline, not that the ramp was conservative.
+    try std.testing.expect(inked > 0);
+    try std.testing.expect(partial > 0);
+}

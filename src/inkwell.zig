@@ -3939,6 +3939,32 @@ pub fn strokeCoverage(field: []const f32, out: []u8, width: u8) void {
     }
 }
 
+/// As `strokeCoverage`, but antialiased from the field itself.
+///
+/// The hard ramp above is a threshold, so every edge it draws is a stair. The
+/// field already carries sub-pixel distance, so the band's two boundaries can
+/// be softened for free: a pixel exactly on a boundary is half covered, and one
+/// `aa` pixels either side is fully in or fully out.
+///
+/// `aa` is the width in pixels of the half-covered strip at each boundary. Zero
+/// gives the hard ramp back, which is why there is no separate hard function
+/// for callers that want it.
+pub fn strokeCoverageAA(field: []const f32, out: []u8, width: u8, aa: f32) void {
+    const w: f32 = @floatFromInt(width);
+    const inner = -w;
+    if (aa <= 0) return strokeCoverage(field, out, width);
+    const inv = 1.0 / aa;
+    for (out, field) |*o, d| {
+        // Signed distance to the nearest band boundary. Positive means inside
+        // the band, so the ramp is a clamp of half-width + distance.
+        const to_outer = w - d; // >0 inside the band from outside
+        const to_inner = d - inner; // >0 inside the band from inside
+        const m = @min(to_outer, to_inner);
+        const c = (m + aa * 0.5) * inv;
+        o.* = @intFromFloat(@max(0.0, @min(1.0, c)) * 255.0 + 0.5);
+    }
+}
+
 /// Glyph DISTANCE FIELDS kept between draws, so a stroke of any width costs a
 /// lookup and a ramp instead of a fresh field.
 ///
@@ -7895,3 +7921,38 @@ test "ink bounds handle a run of off-curve points" {
     try std.testing.expectEqual(@as(i32, 100), b.y1);
 }
 
+
+test "strokeCoverageAA softens the band edges that the hard ramp stairs" {
+    // A single vertical wall at x=5 in a 10-wide strip, distances measured from
+    // it: negative to the left (ink), positive to the right (outside).
+    // Distances are deliberately OFF the half-pixel grid: on it, every pixel
+    // sits exactly on a boundary or exactly on a centre, so the ramp clamps
+    // everywhere and there is nothing soft to observe.
+    var field: [10]f32 = undefined;
+    for (&field, 0..) |*d, i| d.* = @as(f32, @floatFromInt(i)) - 5.3;
+
+    var hard: [10]u8 = undefined;
+    strokeCoverage(&field, &hard, 2);
+
+    var soft: [10]u8 = undefined;
+    strokeCoverageAA(&field, &soft, 2, 1.0);
+
+    // The hard ramp is binary by construction; the soft one must not be, or it
+    // is not antialiasing anything.
+    for (hard) |v| try std.testing.expect(v == 0 or v == 255);
+    var partial: usize = 0;
+    for (soft) |v| partial += @intFromBool(v != 0 and v != 255);
+    try std.testing.expect(partial > 0);
+
+    // Every pixel the hard ramp inks must still be inked, and every pixel it
+    // leaves out must stay dark: aa changes coverage values, not the band.
+    for (hard, soft) |h, s| {
+        if (h != 0) try std.testing.expect(s > 0);
+        if (h == 0) try std.testing.expect(s < 255);
+    }
+
+    // aa = 0 is the hard ramp, not a special case with its own behaviour.
+    var same: [10]u8 = undefined;
+    strokeCoverageAA(&field, &same, 2, 0);
+    try std.testing.expectEqualSlices(u8, &hard, &same);
+}

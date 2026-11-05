@@ -129,6 +129,25 @@ pub fn build(b: *std.Build) void {
     const varseq_step = b.step("varseq", "check cmap format 14 against a real face (-Dvarseq=path)");
     varseq_step.dependOn(&run_varseq.step);
 
+    // Signed distance fields for stroke, against a real face. A separate
+    // module for the same reason as the others: it reads a file while the
+    // library itself never does.
+    const field_mod = b.createModule(.{
+        .root_source_file = b.path("test/field_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "inkwell", .module = inkwell_mod }},
+        .link_libc = true,
+    });
+    const field_tests = b.addTest(.{ .root_module = field_mod });
+    const run_field = b.addRunArtifact(field_tests);
+    run_field.has_side_effects = true;
+    if (font_opt) |f| {
+        run_field.setEnvironmentVariable("INKWELL_FACE", f);
+    }
+    const field_step = b.step("field", "check stroke distance fields against a real face (-Dfont=path)");
+    field_step.dependOn(&run_field.step);
+
     const fuzz_step = b.step("fuzz", "mangle the face under -Dfont (or INKWELL_TEST_FONT): truncations and bit flips");
     fuzz_step.dependOn(&run_fuzz.step);
 }

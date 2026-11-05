@@ -6,6 +6,9 @@ pub fn build(b: *std.Build) void {
     // Read once: b.option panics if the same name is declared twice.
     const font_opt = b.option([]const u8, "font", "path to a TTF/OTF for the bench and fuzz runs");
     const pairs_opt = b.option([]const u8, "pairs", "fontpath|pairsfile[;...] manifest for the GPOS differential");
+    const varseq_opt = b.option([]const u8, "varseq", "face carrying a cmap format 14 subtable");
+    const novarseq_opt = b.option([]const u8, "novarseq", "face with no format 14, for the negative test");
+    const varseq_math_opt = b.option([]const u8, "varseq-math", "a NON-DEFAULT-only face (Noto Sans Math shape)");
 
     // The library: pure Zig, no libc, no C, no allocator.
     const inkwell_mod = b.addModule("inkwell", .{
@@ -100,6 +103,31 @@ pub fn build(b: *std.Build) void {
     }
     const gpos_step = b.step("gpos", "compare GPOS pair adjustments against fontTools (-Dpairs=manifest)");
     gpos_step.dependOn(&run_gpos.step);
+
+    // Unicode Variation Sequences (cmap format 14), against a real face. A
+    // variation sequence is a PAIR, so this cannot ride on -Dfont like the
+    // others: it needs a face that actually carries the subtable.
+    const varseq_mod = b.createModule(.{
+        .root_source_file = b.path("test/varseq_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "inkwell", .module = inkwell_mod }},
+        .link_libc = true,
+    });
+    const varseq_tests = b.addTest(.{ .root_module = varseq_mod });
+    const run_varseq = b.addRunArtifact(varseq_tests);
+    run_varseq.has_side_effects = true;
+    if (varseq_opt) |p| {
+        run_varseq.setEnvironmentVariable("INKWELL_VARSEQ", p);
+    }
+    if (novarseq_opt) |p| {
+        run_varseq.setEnvironmentVariable("INKWELL_NO_VARSEQ", p);
+    }
+    if (varseq_math_opt) |p| {
+        run_varseq.setEnvironmentVariable("INKWELL_VARSEQ_MATH", p);
+    }
+    const varseq_step = b.step("varseq", "check cmap format 14 against a real face (-Dvarseq=path)");
+    varseq_step.dependOn(&run_varseq.step);
 
     const fuzz_step = b.step("fuzz", "mangle the face under -Dfont (or INKWELL_TEST_FONT): truncations and bit flips");
     fuzz_step.dependOn(&run_fuzz.step);

@@ -46,6 +46,7 @@ const std = @import("std");
 const cff = @import("cff.zig");
 const colr = @import("colr.zig");
 const variations = @import("variations.zig");
+pub const linebreak = @import("linebreak.zig");
 
 pub const Layer = colr.Layer;
 pub const Rgba = colr.Rgba;

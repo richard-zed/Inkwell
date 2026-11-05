@@ -14,9 +14,40 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // The UAX #14 conformance corpus is 2.9 MB of generated Zig and is not
+    // part of the published package, so a test module is compiled only when it
+    // is present. It lives outside `src/` deliberately: `@import` across a
+    // module boundary needs a named import, and naming it inside the library
+    // module would put the corpus in every consumer's build.
+    const corpus_present = if (b.build_root.handle.access(
+        b.graph.io,
+        "test/linebreak/linebreak_cases.zig",
+        .{},
+    )) |_| true else |_| false;
+    const test_mod = if (corpus_present) blk: {
+        const cases_mod = b.createModule(.{
+            .root_source_file = b.path("test/linebreak/linebreak_cases.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        break :blk b.createModule(.{
+            .root_source_file = b.path("test/linebreak/linebreak_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "inkwell", .module = inkwell_mod },
+                .{ .name = "linebreak_cases", .module = cases_mod },
+            },
+        });
+    } else null;
+
     const unit_tests = b.addTest(.{ .root_module = inkwell_mod });
     const test_step = b.step("test", "run the unit tests (no font file needed)");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
+    if (test_mod) |tm| {
+        const conf_tests = b.addTest(.{ .root_module = tm });
+        test_step.dependOn(&b.addRunArtifact(conf_tests).step);
+    }
 
     // Malformed input: truncate and flip bits, on a real face. Separate test
     // binary so the ordinary suite stays fast, and skipped when no font is

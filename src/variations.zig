@@ -15,7 +15,15 @@
 
 const std = @import("std");
 
-pub const max_axes = 8;
+/// Axes one face's variation space may carry.
+///
+/// 16, not 8: Roboto Flex declares THIRTEEN, and the old bound was used as a
+/// validity GATE as well as an array size, so `axis_count > max_axes` bailed
+/// silently and every glyph of a 13-axis face drew its default outline at
+/// every weight. 8 is also the ceiling of the classic gvar encoder, which is
+/// why the number looked safe. 16 costs ~100 bytes per Font and no other font
+/// runtime rejects a face for exceeding it.
+pub const max_axes = 16;
 /// Points one glyph's delta decode may touch. Beyond this the glyf is left at
 /// its default outline rather than half-varied.
 pub const max_points = 1024;
@@ -488,6 +496,181 @@ pub fn applyGlyph(
     return any;
 }
 
+// --- HVAR: advance deltas ------------------------------------------------
+//
+// `gvar` varies the outline; without HVAR the glyph shape changes with a
+// weight or width axis while its advance stays at the default, so a varied
+// run shapes to the wrong total width. The table is an ItemVariationStore
+// plus an optional DeltaSetIndexMap per metric; only advances are handled
+// here, because LSB/RSB deltas exist for rasterisers that snap outlines and
+// this one measures bearings off the outline it already has.
+//
+// The subtlety worth naming: when the advance map is ABSENT the glyph id
+// indexes the store DIRECTLY (glyph `g` is outer 0, inner `g`). Fonts with
+// 948 glyphs and 58 subtables -- Roboto Flex among them -- always ship the
+// map, so the direct path is easy to leave broken and never notice.
+
+/// Big-endian readers over a table slice, bounds-checked to `error.Malformed`.
+fn be16(d: []const u8, at: usize) Error!u16 {
+    if (at + 2 > d.len) return error.Malformed;
+    return (@as(u16, d[at]) << 8) | d[at + 1];
+}
+
+fn be32(d: []const u8, at: usize) Error!u32 {
+    if (at + 4 > d.len) return error.Malformed;
+    return (@as(u32, d[at]) << 24) | (@as(u32, d[at + 1]) << 16) |
+        (@as(u32, d[at + 2]) << 8) | d[at + 3];
+}
+
+/// Horizontal advance delta for `gid` at the normalised `coords`, in font
+/// units. Zero when the face has no HVAR or the glyph is outside its map.
+pub fn hvarAdvanceDelta(data: []const u8, gid: u16, coords: []const f32) Error!i16 {
+    if (data.len < 20) return 0;
+    const ivs_rel = try be32(data, 4);
+    const map_rel = try be32(data, 8);
+    const ivs = @as(usize, ivs_rel);
+    if (ivs + 8 > data.len) return error.Malformed;
+
+    // ItemVariationStore: format, regionListOffset, itemVariationDataCount.
+    const region_rel = try be32(data, ivs + 2);
+    const data_count = try be16(data, ivs + 6);
+    const regions_at = ivs + @as(usize, region_rel);
+    const axis_count = try be16(data, regions_at);
+    const region_count = try be16(data, regions_at + 2);
+    const triples = regions_at + 4;
+
+    // DeltaSetIndexMap -> (outer, inner). Absent means index by glyph id.
+    var outer: u16 = 0;
+    var inner: u16 = gid;
+    if (map_rel != 0) {
+        const m = @as(usize, map_rel);
+        const entry_format = data[m + 1];
+        const map_count = try be16(data, m + 2);
+        const entry_size: usize = ((entry_format & 0x30) >> 4) + 1;
+        const inner_bits: u5 = @intCast((entry_format & 0x0F) + 1);
+        if (map_count != 0) {
+            const row = @min(@as(usize, gid), map_count - 1);
+            const at = m + 4 + row * entry_size;
+            if (at + entry_size > data.len) return error.Malformed;
+            var v: u32 = 0;
+            for (data[at..][0..entry_size]) |b| v = (v << 8) | b;
+            inner = @truncate(v & ((@as(u32, 1) << inner_bits) - 1));
+            outer = @truncate(v >> inner_bits);
+        }
+    }
+    if (outer >= data_count) return 0;
+
+    const sub = ivs + @as(usize, try be32(data, ivs + 8 + @as(usize, outer) * 4));
+    const item_count = try be16(data, sub);
+    // High bit of wordDeltaCount means 32-bit words; otherwise 16-bit then
+    // 8-bit. Roboto Flex uses the plain form, but the flag is one test.
+    const raw_words = try be16(data, sub + 2);
+    const long_words = (raw_words & 0x8000) != 0;
+    const word_count: usize = raw_words & 0x7FFF;
+    const region_index_count = try be16(data, sub + 4);
+    if (inner >= item_count) return 0;
+
+    // Fonts in the wild disagree about whether word_count counts words or
+    // region indices; clamp so a bad count cannot read past the row.
+    const words = @min(word_count, region_index_count);
+    const shorts = region_index_count - words;
+    const stride = words * (if (long_words) @as(usize, 4) else @as(usize, 2)) + shorts;
+    const row = sub + 6 + @as(usize, region_index_count) * 2 + @as(usize, inner) * stride;
+
+    var total: f32 = 0;
+    var col: usize = 0;
+    while (col < region_index_count) : (col += 1) {
+        const region = try be16(data, sub + 6 + col * 2);
+        if (region >= region_count) continue;
+        var delta: i32 = 0;
+        if (col < words) {
+            if (long_words) {
+                delta = @bitCast(try be32(data, row + col * 4));
+            } else {
+                delta = @as(i16, @bitCast(try be16(data, row + col * 2)));
+            }
+        } else {
+            const at = row + words * (if (long_words) @as(usize, 4) else @as(usize, 2)) + (col - words);
+            if (at >= data.len) return error.Malformed;
+            delta = @as(i8, @bitCast(data[at]));
+        }
+        if (delta == 0) continue;
+
+        // Region scalar: product over axes, in the same normalised space the
+        // tuple code uses, so `tupleScalar` is reused rather than re-derived.
+        var peaks: [max_axes]f32 = @splat(0);
+        var starts: [max_axes]f32 = @splat(0);
+        var ends: [max_axes]f32 = @splat(0);
+        const n = @min(@as(usize, axis_count), max_axes);
+        for (0..n) |a| {
+            const t = triples + (region * axis_count + a) * 6;
+            starts[a] = @as(f32, @floatFromInt(@as(i16, @bitCast(try be16(data, t))))) / 16384.0;
+            peaks[a] = @as(f32, @floatFromInt(@as(i16, @bitCast(try be16(data, t + 2))))) / 16384.0;
+            ends[a] = @as(f32, @floatFromInt(@as(i16, @bitCast(try be16(data, t + 4))))) / 16384.0;
+        }
+        const scalar = tupleScalar(peaks[0..n], starts[0..n], ends[0..n], coords);
+        if (scalar == 0) continue;
+        total += @as(f32, @floatFromInt(delta)) * scalar;
+    }
+    return @intFromFloat(std.math.round(total));
+}
+
+test "HVAR indexes the advance map when one is present" {
+    // One axis, one region covering +1, TWO subtables, and an advance map that
+    // points glyph 0 at subtable 1. A decoder that ignored the map would index
+    // subtable 0 -- which has no items -- and answer 0 instead of 42.
+    //
+    // Layout, all offsets from the HVAR table start:
+    //   0   header (20 bytes): ivs at 20, advance map at 96
+    //   20  ItemVariationStore: format 1, regionList at +12 (32), 2 subtables
+    //   28  subtable offsets -- part of the store header, do not overlap
+    //   32  region list: 1 axis, 1 region, triple (0, 1, 1)
+    //   44  subtable 0: zero items
+    //   52  subtable 1: one item, one region index, one 8-bit delta of 42
+    //   96  advance map: format 0, innerBits 8, count 1, entry 1<<8
+    var buf: [128]u8 = @splat(0);
+    const w = std.mem.writeInt;
+    w(u32, buf[4..8], 20, .big);
+    w(u32, buf[8..12], 96, .big);
+
+    w(u16, buf[20..22], 1, .big); // format
+    w(u32, buf[22..26], 12, .big); // regionList -> 32
+    w(u16, buf[26..28], 2, .big); // data count
+    w(u32, buf[28..32], 24, .big); // subtable 0 -> 44
+    w(u32, buf[32..36], 32, .big); // subtable 1 -> 52
+
+    // Region list begins at 32 -- but the subtable offsets END at 32, so the
+    // list must start at 36 instead. Point it there.
+    w(u32, buf[22..26], 16, .big); // regionList -> 36
+    w(u16, buf[36..38], 1, .big); // axisCount
+    w(u16, buf[38..40], 1, .big); // regionCount
+    w(i16, buf[40..42], 0, .big);
+    w(i16, buf[42..44], 16384, .big);
+    w(i16, buf[44..46], 16384, .big);
+
+    // Subtable 0 at 56: zero items, so an unmapped glyph finds nothing.
+    w(u32, buf[28..32], 36, .big); // sub 0 -> 56
+    w(u32, buf[32..36], 52, .big); // sub 1 -> 72
+    w(u16, buf[56..58], 0, .big);
+
+    // Subtable 1 at 72: one item, regionIndexCount 1, all deltas 8-bit.
+    w(u16, buf[72..74], 1, .big); // itemCount
+    w(u16, buf[74..76], 0, .big); // wordDeltaCount
+    w(u16, buf[76..78], 1, .big); // regionIndexCount
+    w(u16, buf[78..80], 0, .big); // region index 0
+    buf[80] = 42;
+
+    // Advance map at 96. entryFormat packs two fields: bits 0-3 hold
+    // innerBits-1, bits 4-5 hold entrySize-1. 0x17 = 2-byte entry, 8 inner
+    // bits, which is what Roboto Flex uses. A one-byte entry (0x07) cannot
+    // hold outer=1 and silently truncates it to 0.
+    buf[97] = 0x17;
+    w(u16, buf[98..100], 1, .big);
+    w(u16, buf[100..102], 1 << 8, .big);
+
+    try std.testing.expectEqual(@as(i16, 42), try hvarAdvanceDelta(buf[0..110], 0, &.{1.0}));
+}
+
 test "a normalised axis lands on the F2Dot14 grid" {
     const a = Axis{ .tag = 0, .min = 100, .default = 400, .max = 900 };
     // (700 - 400) / (900 - 400) = 0.6, which 16.14 cannot represent: the grid
@@ -525,4 +708,74 @@ test "IUP yields no delta when both references share a coordinate" {
     iupContour(&xs2, &ys, &dx2, &dy2, &touched2, 0, 4);
     try std.testing.expectEqual(@as(f32, 45), dx2[2]);
     try std.testing.expectEqual(@as(f32, 18), dx2[1]);
+}
+
+test "HVAR falls back to glyph-id indexing when no advance map is present" {
+    // UbuntuMono ships HVAR with advanceMapOffset 0, so the glyph id indexes
+    // the store directly: outer 0, inner gid. Nothing else in the library
+    // exercises this branch, and a decoder that always expected a map would
+    // reject every mono face.
+    var buf: [96]u8 = @splat(0);
+    const w = std.mem.writeInt;
+    w(u32, buf[4..8], 20, .big); // ivs at 20
+    w(u32, buf[8..12], 0, .big); // NO advance map
+
+    w(u16, buf[20..22], 1, .big);
+    w(u32, buf[22..26], 16, .big); // regionList -> 36
+    w(u16, buf[26..28], 1, .big); // one subtable
+    w(u32, buf[28..32], 36, .big); // subtable 0 -> 56
+
+    w(u16, buf[36..38], 1, .big); // axisCount
+    w(u16, buf[38..40], 1, .big); // regionCount
+    w(i16, buf[40..42], 0, .big);
+    w(i16, buf[42..44], 16384, .big);
+    w(i16, buf[44..46], 16384, .big);
+
+    // Subtable 0 at 56: itemCount 3 so glyph 2 is addressable, one region
+    // index, and three 8-bit deltas -- 0, 7, -5.
+    w(u16, buf[56..58], 3, .big);
+    w(u16, buf[58..60], 0, .big); // wordDeltaCount 0 -> all 8-bit
+    w(u16, buf[60..62], 1, .big); // regionIndexCount
+    w(u16, buf[62..64], 0, .big); // region index 0
+    buf[64] = 0;
+    buf[65] = 7;
+    buf[66] = @bitCast(@as(i8, -5));
+
+    // Glyph 1 -> item 1 -> +7, with no map to say otherwise.
+    try std.testing.expectEqual(@as(i16, 7), try hvarAdvanceDelta(buf[0..96], 1, &.{1.0}));
+    // Glyph 2 -> item 2 -> -5.
+    try std.testing.expectEqual(@as(i16, -5), try hvarAdvanceDelta(buf[0..96], 2, &.{1.0}));
+    // Glyph 0 -> item 0 -> a real zero, not an error.
+    try std.testing.expectEqual(@as(i16, 0), try hvarAdvanceDelta(buf[0..96], 0, &.{1.0}));
+    // Past itemCount the glyph is outside the store and must answer 0.
+    try std.testing.expectEqual(@as(i16, 0), try hvarAdvanceDelta(buf[0..96], 9, &.{1.0}));
+}
+
+test "HVAR delta is zero away from the region that defines it" {
+    var buf: [96]u8 = @splat(0);
+    const w = std.mem.writeInt;
+    w(u32, buf[4..8], 20, .big);
+    w(u32, buf[8..12], 0, .big);
+    w(u16, buf[20..22], 1, .big);
+    w(u32, buf[22..26], 16, .big);
+    w(u16, buf[26..28], 1, .big);
+    w(u32, buf[28..32], 36, .big);
+    // Region covers only the POSITIVE side: (0, 1, 1).
+    w(u16, buf[36..38], 1, .big);
+    w(u16, buf[38..40], 1, .big);
+    w(i16, buf[40..42], 0, .big);
+    w(i16, buf[42..44], 16384, .big);
+    w(i16, buf[44..46], 16384, .big);
+    w(u16, buf[56..58], 1, .big);
+    w(u16, buf[58..60], 0, .big);
+    w(u16, buf[60..62], 1, .big);
+    w(u16, buf[62..64], 0, .big);
+    buf[64] = 20;
+
+    // At +1 the region applies in full.
+    try std.testing.expectEqual(@as(i16, 20), try hvarAdvanceDelta(buf[0..96], 0, &.{1.0}));
+    // At 0 it applies not at all -- the default instance must not be doubled.
+    try std.testing.expectEqual(@as(i16, 0), try hvarAdvanceDelta(buf[0..96], 0, &.{0.0}));
+    // On the negative side it is outside the region entirely.
+    try std.testing.expectEqual(@as(i16, 0), try hvarAdvanceDelta(buf[0..96], 0, &.{-1.0}));
 }

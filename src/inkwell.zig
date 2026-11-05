@@ -295,11 +295,20 @@ pub const flatten_tolerance: f32 = 0.35;
 
 pub fn outlineBounds(o: Outline) Box {
     if (o.points.len == 0) return .{ .x0 = 0, .y0 = 0, .x1 = 0, .y1 = 0 };
+    // Seed from the first ON-curve point: seeding from a control point would
+    // put a corner of the box where no ink ever is.
+    var first: usize = 0;
+    for (o.points, 0..) |p, i| {
+        if (p.on) {
+            first = i;
+            break;
+        }
+    }
     var b = Box{
-        .x0 = o.points[0].x,
-        .y0 = o.points[0].y,
-        .x1 = o.points[0].x,
-        .y1 = o.points[0].y,
+        .x0 = o.points[first].x,
+        .y0 = o.points[first].y,
+        .x1 = o.points[first].x,
+        .y1 = o.points[first].y,
     };
     for (o.points[1..]) |pt| {
         b.x0 = @min(b.x0, pt.x);
@@ -308,6 +317,132 @@ pub fn outlineBounds(o: Outline) Box {
         b.y1 = @max(b.y1, pt.y);
     }
     return b;
+}
+
+/// Ink bounds of a decoded outline, QUADRATIC EXTREMA INCLUDED.
+///
+/// `outlineBounds` min/maxes the control points, which is not the ink box: a
+/// TrueType curve bulges past its control points between them. The error is
+/// invisible on a straight-edged glyph and worst on exactly the round letters
+/// (`o`, `c`, `e`, `s`) that a bitmap is most likely to clip -- the top and
+/// bottom of an `o` sit on curve peaks with no on-curve point near them.
+///
+/// Each contour is walked as overlapping point triples. A quadratic from P0
+/// with control Pc to P2 has at most one extremum per axis, at
+/// t = (P0 - Pc) / (P0 - 2*Pc + P2), included when 0 < t < 1. Runs of two
+/// consecutive off-curve points get their implied on-curve midpoint, since
+/// that is how TrueType stores most curves.
+pub fn outlineInkBounds(o: Outline) Box {
+    if (o.points.len == 0) return .{ .x0 = 0, .y0 = 0, .x1 = 0, .y1 = 0 };
+    var b = Box{ .x0 = 0, .y0 = 0, .x1 = 0, .y1 = 0 };
+    var seeded = false;
+    var start: usize = 0;
+    for (o.ends) |end| {
+        const stop: usize = end;
+        if (stop < start or stop >= o.points.len) break;
+        const n = stop - start + 1;
+
+        // Expand the contour into ON-curve anchors, inserting the implied
+        // midpoint wherever two off-curve points are adjacent. What remains
+        // between consecutive anchors is one straight line (no control) or one
+        // quadratic (the off-curve point between them).
+        var anchors: [variations.max_points]Point = undefined;
+        var na: usize = 0;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const p = o.points[start + i];
+            if (p.on) {
+                anchors[na] = p;
+                na += 1;
+            } else {
+                const q = o.points[start + (i + 1) % n];
+                if (!q.on) {
+                    anchors[na] = .{
+                        .x = @divTrunc(p.x + q.x, 2),
+                        .y = @divTrunc(p.y + q.y, 2),
+                        .on = true,
+                    };
+                    na += 1;
+                }
+            }
+        }
+        // All off-curve contour: the anchors are the midpoints above, and the
+        // first real anchor is the wrap-around midpoint of the last two.
+        if (na == 0) break;
+
+        for (anchors[0..na]) |a| {
+            if (!seeded) {
+                b = .{ .x0 = a.x, .y0 = a.y, .x1 = a.x, .y1 = a.y };
+                seeded = true;
+            } else grow(&b, a.x, a.y);
+        }
+
+        // Curves: for each anchor, if the raw point after it is off-curve then
+        // that point is the control for the span ending at the NEXT anchor.
+        for (0..na) |k| {
+            const from = anchors[k];
+            const to = anchors[(k + 1) % na];
+            const ctrl = findControl(o.points, start, n, from, to);
+            const c = ctrl orelse continue;
+            extremum(&b, from.x, c.x, to.x, .x);
+            extremum(&b, from.y, c.y, to.y, .y);
+        }
+        start = stop + 1;
+        if (start >= o.points.len) break;
+    }
+    return b;
+}
+
+/// The off-curve point lying between two anchors in the raw contour, if any.
+/// Scans forward from `from`; a contour holds at most a handful of points
+/// between anchors, so the linear walk is not worth indexing.
+fn findControl(pts: []const Point, start: usize, n: usize, from: Point, to: Point) ?Point {
+    var i: usize = 0;
+    var seen_from = false;
+    while (i <= n) : (i += 1) {
+        const p = pts[start + (i % n)];
+        if (!seen_from) {
+            if (p.x == from.x and p.y == from.y and p.on) seen_from = true;
+            continue;
+        }
+        if (p.x == to.x and p.y == to.y and p.on) return null;
+        if (!p.on) return p;
+    }
+    return null;
+}
+
+fn grow(b: *Box, x: i32, y: i32) void {
+    b.x0 = @min(b.x0, x);
+    b.y0 = @min(b.y0, y);
+    b.x1 = @max(b.x1, x);
+    b.y1 = @max(b.y1, y);
+}
+
+const Axis = enum { x, y };
+
+/// Include a quadratic Bezier's turning point on one axis when it lands
+/// strictly inside the segment. Solves the derivative for zero.
+fn extremum(b: *Box, a0: i32, nc: i32, a2: i32, axis: Axis) void {
+    const v0: f32 = @floatFromInt(a0);
+    const vc: f32 = @floatFromInt(nc);
+    const v2: f32 = @floatFromInt(a2);
+    const den = v0 - 2 * vc + v2;
+    if (den == 0) return;
+    const t = (v0 - vc) / den;
+    if (t <= 0 or t >= 1) return;
+    const inv = 1 - t;
+    const v = inv * inv * v0 + 2 * inv * t * vc + t * t * v2;
+    const i: i32 = @intFromFloat(@round(v));
+    switch (axis) {
+        .x => {
+            b.x0 = @min(b.x0, i);
+            b.x1 = @max(b.x1, i);
+        },
+        .y => {
+            b.y0 = @min(b.y0, i);
+            b.y1 = @max(b.y1, i);
+        },
+    }
 }
 
 /// Composite glyphs are inlined; eight is more nesting than any real font
@@ -1004,7 +1139,21 @@ pub const Font = struct {
     /// needs both axes: an x-only phase leaves every glyph snapped to a whole
     /// pixel vertically, which is why rows looked uneven at 1.25x.
     pub fn bitmapBoxPhase(self: Font, gid: u16, scale: f32, phase_x: f32, phase_y: f32) GlyphError!PixelBox {
-        const b = (try self.headerBox(gid)) orelse
+        // A VARIED face cannot size its bitmap from the glyph header. The
+        // header declares the box at the DEFAULT instance, and `gvar` pushes
+        // the outline past it as soon as an axis moves -- so the bitmap came
+        // out at default-instance width and every letter lost its right edge at
+        // high weight. The ink box has to come from the varied outline itself.
+        // A static face keeps the declared box, so its bitmaps are byte-for-byte
+        // what they were before this branch existed.
+        const declared: ?Box = if (self.n_coords != 0) blk: {
+            var pts: [variations.max_points]Point = undefined;
+            var ends: [variations.max_points]u16 = undefined;
+            const o = self.outline(gid, &pts, &ends) catch |e| return e;
+            if (o.points.len == 0) break :blk null;
+            break :blk outlineInkBounds(o);
+        } else try self.headerBox(gid);
+        const b = declared orelse
             return .{ .x0 = 0, .y0 = 0, .x1 = 0, .y1 = 0 };
         const f = struct {
             fn v(i: i32, s: f32, add: f32) f32 {
@@ -2306,15 +2455,39 @@ pub const Font = struct {
         if (gid >= self.num_glyphs) return error.UnknownGlyph;
         const hm = try self.slice(self.hmtx);
 
+        var m: HMetrics = undefined;
         if (gid < self.num_hmetrics) {
             const at = @as(usize, gid) * 4;
-            return .{ .advance = try u16At(hm, at), .lsb = try i16At(hm, at + 2) };
+            m = .{ .advance = try u16At(hm, at), .lsb = try i16At(hm, at + 2) };
+        } else {
+            const last = self.num_hmetrics - 1;
+            m.advance = try u16At(hm, @as(usize, last) * 4);
+            const lsb_at = @as(usize, self.num_hmetrics) * 4 + @as(usize, gid - self.num_hmetrics) * 2;
+            m.lsb = try i16At(hm, lsb_at);
         }
+        return self.applyHvar(gid, m);
+    }
 
-        const last = self.num_hmetrics - 1;
-        const advance = try u16At(hm, @as(usize, last) * 4);
-        const lsb_at = @as(usize, self.num_hmetrics) * 4 + @as(usize, gid - self.num_hmetrics) * 2;
-        return .{ .advance = advance, .lsb = try i16At(hm, lsb_at) };
+    /// Add the HVAR advance delta for `gid` at this face's coordinates.
+    ///
+    /// `hmtx` holds advances for the DEFAULT instance. Without this, a varied
+    /// face draws glyphs at the right weight but spaces them at the default
+    /// one, so a line of text ends short or long -- the outline fix and this
+    /// are the two halves of making a variable face actually measure.
+    ///
+    /// A malformed HVAR is treated as absent rather than as an error: advances
+    /// are what layout needs, and refusing them would lose a whole line to a
+    /// table the face did not have to ship.
+    fn applyHvar(self: Font, gid: u16, in: HMetrics) HMetrics {
+        var m = in;
+        if (self.n_coords == 0 or self.hvar_span.len == 0) return m;
+        const d = self.data[self.hvar_span.off..][0..self.hvar_span.len];
+        const delta = variations.hvarAdvanceDelta(d, gid, self.coords[0..self.n_coords]) catch return m;
+        if (delta == 0) return m;
+        const sum = @as(i32, m.advance) + @as(i32, delta);
+        // An advance is unsigned in `hmtx`, so clamp rather than wrap.
+        m.advance = @intCast(@max(0, @min(sum, 0xFFFF)));
+        return m;
     }
 
     /// The component a composite takes its metrics from, if it flags one.
@@ -6871,4 +7044,76 @@ test "a chain picks the first face that can draw the codepoint" {
     // pick returns the face itself, so the caller gets its advances too.
     const hit = Font.pick(&rev_chain, 0x1F600).?;
     try std.testing.expectEqual(full.glyphIndex(0x1F600) catch 0, hit.glyphIndex(0x1F600) catch 0);
+}
+
+test "ink bounds reach past the control points on a bulging curve" {
+    // Closed contour: P0(0,0) on, Pc(50,200) off, P2(100,0) on, then back to
+    // P0 as a straight line. Every control point on the y axis is at y=0, so a
+    // point-only box reports a flat, zero-height shape -- but the curve reaches
+    // y=100 at its apex, which is the ink a bitmap has to fit.
+    var pts = [_]Point{
+        .{ .x = 0, .y = 0, .on = true },
+        .{ .x = 50, .y = 200, .on = false },
+        .{ .x = 100, .y = 0, .on = true },
+    };
+    var ends = [_]u16{2};
+    const o = Outline{ .points = &pts, .ends = &ends };
+
+    // `outlineBounds` takes control points, so it reports y1=200 -- the curve
+    // never gets that high. That over-estimate is why it cannot size a bitmap.
+    try std.testing.expectEqual(@as(i32, 200), outlineBounds(o).y1);
+    const b = outlineInkBounds(o);
+    try std.testing.expectEqual(@as(i32, 100), b.y1);
+    try std.testing.expectEqual(@as(i32, 0), b.y0);
+    // x: the apex of this curve is at t=0.5, x = 2*0.25*50 + 0.25*100 = 50,
+    // which is inside the span of the anchors, so x1 stays the anchor 100.
+    try std.testing.expectEqual(@as(i32, 100), b.x1);
+}
+
+test "ink bounds cover the x apex of a wide arc" {
+    // The case that actually clips a round letter: the widest x is on the
+    // CURVE, between two on-curve points. P0(0,0) - Pc(300,100) - P2(100,0),
+    // closing straight back to P0.
+    //
+    // dx/dt = 0 at t = 0.6 -> x = 2*0.4*0.6*300 + 0.36*100 = 180
+    // dy/dt = 0 at t = 0.5 -> y = 50
+    var pts = [_]Point{
+        .{ .x = 0, .y = 0, .on = true },
+        .{ .x = 300, .y = 100, .on = false },
+        .{ .x = 100, .y = 0, .on = true },
+    };
+    var ends = [_]u16{2};
+    const o = Outline{ .points = &pts, .ends = &ends };
+    const b = outlineInkBounds(o);
+
+    // Anchors span x[0,100]; the curve reaches 180, past the right anchor.
+    try std.testing.expectEqual(@as(i32, 180), b.x1);
+    try std.testing.expectEqual(@as(i32, 0), b.x0);
+    try std.testing.expectEqual(@as(i32, 50), b.y1);
+}
+
+test "ink bounds handle a run of off-curve points" {
+    // TrueType stores most curves as consecutive off-curve points with implied
+    // on-curve midpoints between them. Contour: anchor (0,0), then two
+    // off-curve points, closing to the anchor.
+    //
+    //   A(0,0) on, P(100,100) off, Q(200,100) off, back to A
+    // Implied midpoint M = (150,100). Spans:
+    //   A -> P -> M : quadratic, control P(100,100)
+    //   M -> Q -> A : quadratic, control Q(200,100)
+    var pts = [_]Point{
+        .{ .x = 0, .y = 0, .on = true },
+        .{ .x = 100, .y = 100, .on = false },
+        .{ .x = 200, .y = 100, .on = false },
+    };
+    var ends = [_]u16{2};
+    const o = Outline{ .points = &pts, .ends = &ends };
+    const b = outlineInkBounds(o);
+    // Anchors are A(0,0) and M(150,100); the curve between is a quadratic whose
+    // x apex is 75 at t=0.5 and whose y apex is 50, both inside the anchors'
+    // own span, so the box is the anchors' box.
+    try std.testing.expectEqual(@as(i32, 0), b.x0);
+    try std.testing.expectEqual(@as(i32, 150), b.x1);
+    try std.testing.expectEqual(@as(i32, 0), b.y0);
+    try std.testing.expectEqual(@as(i32, 100), b.y1);
 }

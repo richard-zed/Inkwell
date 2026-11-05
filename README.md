@@ -14,8 +14,12 @@ I'm using this for a UI library, didn't want to use the C dependency, kinda port
 
 Inkwell reads `glyf` and CFF-based fonts, turns outlines into antialiased
 coverage masks, and keeps those masks between draws. It shapes Arabic and Thai
-over GSUB and kerns from GPOS, but it has no fallback chain and no line breaking:
-those are the caller's job.
+over GSUB and kerns from GPOS, and it answers the UAX #14 line-break question.
+
+It has no fallback chain, and it does not lay text out. Given two codepoints it
+says whether a line may break between them; choosing a position from a measured
+width needs advances and a box, which are layout's, so that stays with the
+caller.
 
 ```zig
 var font = try inkwell.Font.init(bytes);           // bytes are yours
@@ -60,12 +64,16 @@ Two properties are the whole point:
 | malformed input: truncation and bit-flip sweeps | done |
 | `post`: italic angle, underline, fixed pitch | done |
 | variable axes: `fvar`, `avar`, `gvar`, on glyphs and on composites | done |
+| `HVAR` advance variation, so a varied face tracks at its own width | done |
+| UAX #14 line breaking: 49 classes, resolved per LB1, conformance-tested | done |
 | colour: COLRv0 layers with CPAL palettes | done |
 | Arabic and Thai shaping, over GSUB features | done |
 | hinting, COLRv1, kern formats 2/3 | out of scope |
 | CFF2 outlines, including `blend` against a variation store | done |
 | GSUB beyond Arabic and Thai, and GSUB 1.1 FeatureVariations | not implemented |
 | GPOS beyond pair adjustment: contextual positioning, GDEF mark filtering, Device tables | out of scope |
+| `cmap` formats other than 4 and 12, including 14 (Unicode Variation Sequences) | not implemented |
+| vertical metrics: `vhea`, `vmtx`, `VORG` | not implemented |
 
 Two kerning surfaces, and they answer different questions. `kern()` reads the
 legacy `kern` table, format 0 only, which is what stb reads; a zero from it means
@@ -130,6 +138,31 @@ replaced by the usual proportions -- a zero thickness draws nothing, so handing
 it back would only make every caller reimplement the substitution. The angle
 does not select an italic face. `fsSelection` does that, and it is already read.
 
+## Line breaking
+
+UAX #14, Unicode 18.0.0, all 49 classes. `resolveClass` applies LB1 first, so
+AI, SA and XX resolve to the class the rules are actually written against -- a
+raw table lookup leaves them unresolved and every rule keyed on AL misses.
+
+The rules are written against a folded run: `Folded` applies LB9, where a
+combining mark or ZWJ takes the class of what precedes it. Building that is a
+pass over the codepoints, so the module does it rather than making every caller
+reimplement it:
+
+```zig
+var breaker: inkwell.linebreak.Breaker(256) = .{};
+var can: [256]bool = undefined;
+breaker.breakBefore(cps, can[0..cps.len]);  // can[i]: break before cps[i]
+```
+
+`can[0]` is always false. Beyond that it is a predicate and stops there: which
+break opportunity becomes a line break depends on measured advances and a box,
+and this library has neither.
+
+The conformance corpus is 2.9 MB of generated Zig kept under `test/`, outside
+the package, so `zig build test` runs 154 tests in a checkout that has it and
+153 in one that does not.
+
 ## Scope
 
 `glyf`, CFF and CFF2 outlines. An OTTO face is read through its `CFF ` table
@@ -156,7 +189,7 @@ The first two agree on translate-only composites, and so does the third.
 
 Two checks still in this repo:
 
-- **`zig build test`** -- the unit suite, 117 tests, no font file needed. The
+- **`zig build test`** -- the unit suite, 154 tests, no font file needed. The
   coverage sweep is graded against brute-force supersampling and hand-computed
   shapes, so it is never marked by its own algebra.
 - **`zig build fuzz -Dfont=<ttf>`** -- a truncated face at every 4000th byte,
@@ -318,17 +351,20 @@ number of glyph-scale pairs you expect hot.
   not a test. The two entry points were graded by inspection until the GSUB
   fixtures landed, and a font-scale regression in Arabic shaping would still
   not be caught by the suite.
-- **The one consumer pins a commit.** A Zig GUI toolkit links this at a specific
-  revision rather than by version range, so an API change here reaches it only
-  when that pin is moved on purpose. Nothing else consumes Inkwell.
+- **The one consumer links this by path, not by version.** A Zig GUI toolkit
+  points at a local working tree, so an API change here reaches it as soon as
+  the tree moves -- there is no pin to move and no version gate between them.
+  Nothing else consumes Inkwell.
 
 - **No bitmap or compressed container.** CBDT/CBLC and `sbix` are not read, so
   a colour-emoji face in its usual format renders nothing; COLR v0 works, and a
   COLR v1 face falls back to its v0 layer list. WOFF and WOFF2 are not read
   either -- decompression needs an allocator, which this library deliberately
   does not have, so hand it a plain `.ttf` or `.otf`.
-- **No line breaking.** UAX #14 is absent, so a CJK paragraph is one unbreakable
-  line; `wrap` records the last space it saw. No bidi, no NFC normalisation.
+- **Line breaking is a predicate, not a layout.** UAX #14 is here and
+  conformance-tested, but it answers "may a line break here" and nothing more.
+  Turning that into line boxes needs measured advances and a width, which is
+  layout. No bidi and no NFC normalisation either.
 
 ## Licence
 

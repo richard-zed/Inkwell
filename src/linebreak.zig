@@ -3962,3 +3962,16 @@ test "unassigned codepoints resolve to AL, not a permissive class" {
     try T.expectEqual(BreakClass.al, resolveClass(0x0378)); // unassigned
     try T.expect(!breaks(&.{ 'a', 'b' }, 1));
 }
+
+test "the README line-breaking sample" {
+    // Compiled so the sample in README.md cannot rot quietly.
+    const cps = [_]u21{ 'H', 'i', ' ', 't', 'h', 'e', 'r', 'e' };
+    var breaker: Breaker(256) = .{};
+    var can: [256]bool = undefined;
+    breaker.breakBefore(&cps, can[0..cps.len]);
+
+    try std.testing.expect(!can[0]); // no line before the first character
+    try std.testing.expect(!can[1]);
+    try std.testing.expect(can[3]); // after the space
+    try std.testing.expect(!can[4]);
+}

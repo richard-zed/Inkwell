@@ -4179,7 +4179,9 @@ pub const FieldCache = struct {
     }
 
     fn probeStart(self: FieldCache, gid: u16, scale_key: u32, phase: Phase, phase_y: Phase, var_key: u32) usize {
+        // zig fmt: off
         var key: u64 = (@as(u64, gid) << 40) ^ (@as(u64, scale_key) << 4) ^ (@as(u64, @intFromEnum(phase)) << 2) ^ @as(u64, @intFromEnum(phase_y)) ^ (@as(u64, var_key) << 48);
+        // zig fmt: on
         key *%= 0x9E3779B97F4A7C15;
         key ^= key >> 29;
         return @intCast((key >> 16) % self.entries.len);
@@ -4267,8 +4269,10 @@ pub const FieldCache = struct {
         vk: u32,
     ) GlyphError!FieldRef {
         _ = width;
+        // zig fmt: off
         const ph = @intFromEnum(phase);
         const phy = @intFromEnum(phase_y);
+        // zig fmt: on
         const box = try font.bitmapBoxPhase(gid, scale, ph, phy);
         const w: u32 = if (box.x1 > box.x0) @intCast(box.x1 - box.x0) else 0;
         const h: u32 = if (box.y1 > box.y0) @intCast(box.y1 - box.y0) else 0;

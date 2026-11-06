@@ -205,24 +205,16 @@ only bites where it survives the optimiser, in a method called per hit in the
 hot loop. The decode chain still takes `Font` by value deliberately; converting
 all nine signatures to `*const Font` was measured and did not help.
 
-## Profiles
-
-| profile | ref | contains |
-|---|---|---|
-| full | `Zig-0.16`, `main` | outlines, shaping, variations, colour, varseq |
-| minimal | `v0.2.1-zig0.17` | Latin TrueType `glyf` decode and rasterise, caches |
-
-The minimal line is frozen: TrueType only, no CFF, no shaping, no variations, no
-colour. Take it for the smaller API surface — Zig compiles only reachable code,
-so a consumer that never shapes already elides those modules. It buys fewer
-types, not a smaller binary.
+## Install
 
 ```zon
 .inkwell = .{
-    .url = "git+https://github.com/richard-zed/inkwell?ref=Zig-0.16",
+    .url = "git+https://github.com/richard-zed/inkwell",
     .hash = "...",
 },
 ```
+
+Requires Zig 0.16 or newer. Track `main`, or pin a tag.
 
 ## Caches
 

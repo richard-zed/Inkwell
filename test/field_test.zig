@@ -65,7 +65,14 @@ test "flattening keeps horizontal edges on a real glyph" {
         var edges: [4096]inkwell.Edge = undefined;
 
         const without = try font.edgesIntoPhase(
-            gid, scale, 0, 0, box, outline.points, outline.ends, &edges,
+            gid,
+            scale,
+            0,
+            0,
+            box,
+            outline.points,
+            outline.ends,
+            &edges,
         );
         var horiz_without: usize = 0;
         for (edges[0..without]) |e| {
@@ -73,7 +80,14 @@ test "flattening keeps horizontal edges on a real glyph" {
         }
 
         const with = try font.edgesIntoPhaseOpt(
-            gid, scale, 0, 0, box, outline.points, outline.ends, &edges,
+            gid,
+            scale,
+            0,
+            0,
+            box,
+            outline.points,
+            outline.ends,
+            &edges,
             .{ .keep_horizontal = true },
         );
         var horiz_with: usize = 0;

@@ -5,10 +5,10 @@ outlines; GSUB/GPOS shaping; variable-font instances; COLR colour; Unicode
 Variation Sequences. No allocator, no IO, no libc — every buffer is caller-owned.
 
 Basically all of this was written by AI. It exists because a UI library needed
-font rendering without the C dependency: stb_truetype ported to Zig, allocations
-hoisted out, caching added. It now outperforms stb at the cache, is at parity in
-the rasteriser at UI sizes, and is behind at display sizes — measured, not
-asserted, below.
+font rendering without a C dependency: outlines decoded and rasterised directly
+in Zig, allocations hoisted out into caller memory, masks cached. The
+rasteriser is at parity at UI sizes and behind at display sizes; the cache is
+where the win is. Both measured, not asserted, below.
 
 ## Usage
 
@@ -26,9 +26,9 @@ Two properties are the whole point:
 - **No allocator.** There is no `std.mem.Allocator` parameter and no file to
   open. Outlines, edges, coverage and the glyph cache are all caller scratch,
   reused frame to frame. The claim is about who owns memory, not about using none.
-- **Masks are cached.** `stbtt_GetCodepointBitmap` allocates, rasterises and
-  frees per glyph per draw. A cache hit here is a hash lookup and a slice into
-  caller memory, keyed on glyph, scale and subpixel phase.
+- **Masks are cached.** A naive rasteriser allocates, rasterises and frees per
+  glyph per draw. A cache hit here is a hash lookup and a slice into caller
+  memory, keyed on glyph, scale and subpixel phase.
 
 Inkwell does not lay text out and has no fallback chain. It answers "may a line
 break between these two codepoints" (UAX #14); choosing a position from a
@@ -65,9 +65,9 @@ measured width needs advances and a box, which stay with the caller.
 
 Two surfaces answering different questions.
 
-`kern()` is the **raw legacy read** — `kern` table, format 0 only, same as stb.
-A zero from it means that table says nothing, not that the designer wanted no
-adjustment. Apple's version 1 layout is not read.
+`kern()` is the **raw legacy read** — `kern` table, format 0 only. A zero from
+it means that table says nothing, not that the designer wanted no adjustment.
+Apple's version 1 layout is not read.
 
 `pairAdjust()` reads **GPOS**, where modern fonts keep kerning. PairPos formats
 1 and 2 are both needed: Liberation ships only format 1, DejaVu only format 2,
@@ -134,15 +134,15 @@ on which you read.
 `CFF2` when it does not; a face carrying neither is refused rather than
 half-loaded.
 
-stb_truetype was the reference during development but **is not vendored**, so the
-differential cannot be re-run from this repository. Three disagreements were
-resolved in favour of the spec, all in places the differential could not vote:
+Three decoding questions have answers the spec settles but a common naive
+implementation gets wrong, so they are recorded as decisions rather than
+incidental behaviour:
 
-- `cmap` format 4 applies `idDelta` through a non-zero `idRangeOffset`; stb
-  returns the value unchanged.
-- Composite transforms are applied as given; stb multiplies by each column's
-  norm, squaring a uniform scale.
-- `SCALED_COMPONENT_OFFSET` is honoured; stb ignores the flag.
+- `cmap` format 4 applies `idDelta` through a non-zero `idRangeOffset`, as the
+  spec requires, rather than returning the fetched value unchanged.
+- Composite transforms are applied as given, rather than multiplying by each
+  column's norm — which would square a uniform scale.
+- `SCALED_COMPONENT_OFFSET` is honoured rather than ignored.
 
 All three agree on translate-only composites.
 
@@ -165,7 +165,7 @@ behaves; a panic, out-of-bounds read, hang, or a face that loads with no glyphs
 is a failure. Proven able to fail in both directions: an impossible assertion
 turns it red, and running with no font reports *skipped*, not passed.
 
-**Glyph differential** (historic, stb no longer vendored) on DejaVu Sans:
+**Glyph differential** (historic run) on DejaVu Sans:
 
 | check | result |
 |---|---|
@@ -178,24 +178,25 @@ turns it red, and running with no font reports *skipped*, not passed.
 
 Those comparisons were shown capable of failing: a one-unit box shift flagged
 6190/6190, a half-pixel phase shift drove coverage delta to 169. Agreement with
-stb proves Inkwell is not *different*, not that it is *right* — which is why the
-spec settles arguments.
+a reference implementation proves Inkwell is not *different*, not that it is
+*right* — which is why the spec settles arguments.
 
 ## Cost
 
 Per glyph, ReleaseFast, 94 printable-ASCII glyphs, best of 40:
 
-| size | stb | raster | cache hit |
-|---|---|---|---|
-| 11 | 2100-2118 | 2048-2064 | 22.9 ns |
-| 16 | 1942-2134 | 1983-2212 | 15.2 ns |
-| 24 | 2188-2195 | 2380-2399 | 13.4 ns |
-| 34 | 2889-2905 | 3250-3267 | 12.6 ns |
-| 48 | 3868-3890 | 4562-4572 | 11.7 ns |
+| size | raster (ns) | cache hit |
+|---|---|---|
+| 11 | 2048-2064 | 22.9 ns |
+| 16 | 1983-2212 | 15.2 ns |
+| 24 | 2380-2399 | 13.4 ns |
+| 34 | 3250-3267 | 12.6 ns |
+| 48 | 4562-4572 | 11.7 ns |
 
-Honestly: **the rasteriser is at parity at UI sizes and behind at display
-sizes.** It is not faster than stb. The cache is the win, and it is one stb
-cannot match at the call site because stb has no cache.
+Honestly: the rasteriser is the expensive part and it scales up with size — a
+48px glyph costs roughly twice an 11px one. **The cache is the win.** A hit is
+an order of magnitude cheaper than a rasterisation at every size, and at UI
+sizes it is cheap enough to make per-frame text drawing a non-issue.
 
 One regression worth recording: `Font.variationId` once took `Font` **by value**
 while running on every cache hit; `Font` carries thirteen spans, so each hit

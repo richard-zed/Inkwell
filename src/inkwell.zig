@@ -3870,9 +3870,6 @@ pub fn splatField(
 
     // Only within the band can an edge be the nearest one. Everything past it
     // keeps the seed and takes its sign from the coverage directly.
-    var band = [_]bool{false} ** 0;
-    _ = &band;
-
     for (edges) |e| {
         if (e.y0 == e.y1 and e.x0 == e.x1) continue;
         const ylo = @floor(@min(e.y0, e.y1)) - reach;
@@ -3929,13 +3926,24 @@ pub fn splatField(
 /// width up to its own. This is O(pixels) and measured ~2us on a CJK glyph,
 /// flat at width 1, 2 and 4.
 pub fn strokeCoverage(field: []const f32, out: []u8, width: u8) void {
-    const w: f32 = @floatFromInt(width);
+    // `width` is the TOTAL thickness in pixels, straddling the outline.
+    //
+    // The outline is a LINE, not a row: it falls between pixel centres, so a
+    // field sampled down a column reads +-0.5 at the two rows it separates and
+    // never hits exactly 0. A band of half-width `width/2` therefore covers
+    // `width + 1` rows for widths that land on a half-pixel boundary -- a 1px
+    // stroke touches the two rows either side of the line, which is the
+    // minimum any antialiased 1px line can occupy.
+    //
+    // The old code took the FULL width each way (`+-width`, not `+-width/2`),
+    // which covered `2*width + 1` rows: `.stroke = 1` drew as a 3-row band and
+    // `.stroke = 4` as nine, the "maybe twice or more the pixels" reported.
+    const w: f32 = @as(f32, @floatFromInt(width)) * 0.5;
     const inner = -w;
     for (out, field) |*o, d| {
-        // Outside the ink the distance is positive and the band is [0, w].
-        // Just inside the outline it is slightly negative and still in band,
-        // which is what gives the stroke its inner half.
-        o.* = if (d > 0 and d <= w) 255 else if (d > inner and d <= 0) 255 else 0;
+        // Inclusive at both edges so the boundary rows are inked; at width 1
+        // that is the pair of rows straddling the line.
+        o.* = if (d >= inner and d <= w) 255 else 0;
     }
 }
 
@@ -3950,17 +3958,25 @@ pub fn strokeCoverage(field: []const f32, out: []u8, width: u8) void {
 /// gives the hard ramp back, which is why there is no separate hard function
 /// for callers that want it.
 pub fn strokeCoverageAA(field: []const f32, out: []u8, width: u8, aa: f32) void {
-    const w: f32 = @floatFromInt(width);
+    // Half-width each side, as in `strokeCoverage`: `width` is the total.
+    const w: f32 = @as(f32, @floatFromInt(width)) * 0.5;
     const inner = -w;
     if (aa <= 0) return strokeCoverage(field, out, width);
-    const inv = 1.0 / aa;
+    // `aa` is the TOTAL ramp width, centred on the boundary, so it reaches
+    // `aa/2` either side. The old code divided by `aa` and offset by `aa/2`,
+    // which made the ramp `2 * aa` wide -- half a pixel of softness each side
+    // of each boundary, so a 1px band drew as roughly 2px. That is the same
+    // half-width/full-width confusion the band itself had.
+    const half_aa = @max(aa * 0.5, 1e-4);
+    const inv = 1.0 / (half_aa * 2.0);
     for (out, field) |*o, d| {
-        // Signed distance to the nearest band boundary. Positive means inside
-        // the band, so the ramp is a clamp of half-width + distance.
-        const to_outer = w - d; // >0 inside the band from outside
-        const to_inner = d - inner; // >0 inside the band from inside
+        // Signed distance to the nearest band boundary; positive inside the
+        // band. `m + half_aa` puts the ramp's midpoint ON the boundary, so the
+        // band gains no width from antialiasing -- it only softens its edges.
+        const to_outer = w - d;
+        const to_inner = d - inner;
         const m = @min(to_outer, to_inner);
-        const c = (m + aa * 0.5) * inv;
+        const c = (m + half_aa) * inv;
         o.* = @intFromFloat(@max(0.0, @min(1.0, c)) * 255.0 + 0.5);
     }
 }
@@ -4015,6 +4031,11 @@ pub fn strokeGlyph(
 /// computes on the miss -- a per-pixel winding walk is O(pixels x edges) and
 /// measured at 98us on one CJK glyph, against ~1us for reading the coverage
 /// that was going to be discarded anyway.
+/// The widest stroke, in DEVICE pixels, that one baked field answers. Lives
+/// here rather than in the wrapper because the renderer imports inkwell
+/// directly, and two copies of this number would drift apart silently.
+pub const max_stroke_px: u8 = 12;
+
 pub const FieldCache = struct {
     pub const Options = struct {
         /// Slots in the open-addressed key table, as in `Cache`.
@@ -4027,7 +4048,9 @@ pub const FieldCache = struct {
         max_width: u16 = 512,
         /// Every field is built to this width, in pixels, and serves any
         /// narrower stroke from the same numbers.
-        max_width_px: u8 = 4,
+        /// Widest stroke, in total thickness, one field can answer. The bake
+        /// reaches only half this distance; see `max_width_px / 2` at splat.
+        max_width_px: u8 = max_stroke_px,
         /// Arena bytes used only to size `needed()`, as in `Cache`.
         arena: u32 = 256 * 1024,
     };
@@ -4199,6 +4222,8 @@ pub const FieldCache = struct {
         width: u8,
     ) GlyphError!FieldRef {
         if (width == 0) return error.InvalidWidth;
+        // `max_width_px` is the widest STROKE, in total thickness. The bake
+        // reaches half that each side, so the two numbers differ by design.
         if (width > self.opts.max_width_px) return error.FieldTooNarrow;
         const scale_key: u32 = @bitCast(scale);
         const vk = font.variationId();
@@ -4276,7 +4301,12 @@ pub const FieldCache = struct {
         };
 
         const field = self.arena[at..][0..len];
-        splatField(self.edges[0..n], self.cov[0..len], field, w, h, self.opts.max_width_px);
+        // The ramp is half-width each side, so a field only has to reach
+        // half the widest stroke. Baking the full width wasted distance and,
+        // worse, the band is what CLOSES the counter of a thin glyph: reach
+        // too far and a CJK interior narrower than the band disappears.
+        const seed: u8 = @max(1, self.opts.max_width_px / 2);
+        splatField(self.edges[0..n], self.cov[0..len], field, w, h, seed);
 
         if (self.findIndex(gid, scale_key, phase, phase_y, vk)) |i| {
             // A dead entry occupies the chain; reuse its slot for the new key.
@@ -4345,7 +4375,6 @@ pub const FieldCache = struct {
         self.used = 0;
         self.stats.evictions += 1;
     }
-
 };
 
 // ---------------------------------------------------------------------------
@@ -7847,11 +7876,11 @@ test "strokeCoverage ramps a square into a hollow ring" {
     strokeCoverage(&field, &ring, 1);
     // The centre is 2px from every wall: outside a 1px band, so hollow.
     try std.testing.expectEqual(@as(u8, 0), ring[5 * 10 + 5]);
-    // Row 2 holds the wall itself: centre y=2.5 is 0.5 inside it, so a 1px
-    // band covers the stroke's inner half there.
+    // The wall is a LINE at y=2, falling between row 1 (centre 1.5, +0.5
+    // outside) and row 2 (centre 2.5, -0.5 inside). A 1px stroke has
+    // half-width 0.5, so both of those rows are inside the band -- two rows,
+    // which is the fewest an antialiased 1px line can occupy.
     try std.testing.expectEqual(@as(u8, 255), ring[2 * 10 + 5]);
-    // Row 1 centre y=1.5 is 0.5 outside the wall: the outer half of the same
-    // 1px band. Both sides of the outline are inked, which is the point.
     try std.testing.expectEqual(@as(u8, 255), ring[1 * 10 + 5]);
     // Row 3 centre y=3.5 is 1.5 from the wall: past a 1px band, hollow.
     try std.testing.expectEqual(@as(u8, 0), ring[3 * 10 + 5]);
@@ -7867,6 +7896,48 @@ test "strokeCoverage ramps a square into a hollow ring" {
     try std.testing.expect(wide_count > thin_count);
     // The centre survives a 2px band too: still hollow, not filled in.
     try std.testing.expectEqual(@as(u8, 0), wide[5 * 10 + 5]);
+}
+
+test "a stroke's rendered thickness matches its width" {
+    // The assertion the suite was missing: measure the ring's cross-section
+    // instead of trusting the ramp's algebra. Two previous bugs -- a band
+    // taken as a half-width each way, and an AA ramp twice its stated size --
+    // both survived because nothing counted inked pixels.
+    var edges = [_]Edge{
+        .{ .x0 = 2, .y0 = 2, .x1 = 8, .y1 = 2, .dir = 1 },
+        .{ .x0 = 8, .y0 = 2, .x1 = 8, .y1 = 8, .dir = 1 },
+        .{ .x0 = 8, .y0 = 8, .x1 = 2, .y1 = 8, .dir = 1 },
+        .{ .x0 = 2, .y0 = 8, .x1 = 2, .y1 = 2, .dir = 1 },
+    };
+    var cov: [100]u8 = undefined;
+    for (0..10) |y| for (0..10) |x| {
+        cov[y * 10 + x] = if (x >= 2 and x < 8 and y >= 2 and y < 8) 255 else 0;
+    };
+    var field: [100]f32 = undefined;
+    splatField(&edges, &cov, &field, 10, 10, 8);
+
+    // Walk the vertical axis through the middle of the square and count rows
+    // carrying at least HALF ink. Anything less folds the antialiased fringe
+    // into the measurement and reports every stroke a pixel or two thick.
+    //
+    // Count ONE wall, not the whole column: the square has a top AND a bottom,
+    // so a straight count doubles for free. That arithmetic is how the width
+    // looked 2x for as long as it did.
+    //
+    // The outline is a LINE BETWEEN pixel rows (distances are +-0.5, +-1.5,
+    // +-2.5 -- 0 never occurs), so a band of `width` centred on it covers
+    // width + 1 rows. That is geometry, not a bug, hence the one-sided
+    // tolerance.
+    for ([_]u8{ 1, 2, 4 }) |width| {
+        var ring: [100]u8 = undefined;
+        strokeCoverageAA(&field, &ring, width, 1.0);
+        var rows: i32 = 0;
+        for (0..5) |y| {
+            if (ring[y * 10 + 5] >= 128) rows += 1;
+        }
+        try std.testing.expect(rows >= @as(i32, width));
+        try std.testing.expect(rows <= @as(i32, width) + 1);
+    }
 }
 
 test "keep_horizontal keeps the edge the sweep drops" {
@@ -7948,7 +8019,6 @@ test "ink bounds handle a run of off-curve points" {
     try std.testing.expectEqual(@as(i32, 0), b.y0);
     try std.testing.expectEqual(@as(i32, 100), b.y1);
 }
-
 
 test "strokeCoverageAA softens the band edges that the hard ramp stairs" {
     // A single vertical wall at x=5 in a 10-wide strip, distances measured from

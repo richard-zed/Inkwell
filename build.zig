@@ -22,7 +22,7 @@ pub fn build(b: *std.Build) void {
     // is present. It lives outside `src/` deliberately: `@import` across a
     // module boundary needs a named import, and naming it inside the library
     // module would put the corpus in every consumer's build.
-    const corpus_present = if (b.build_root.handle.access(
+    const corpus_present = if (std.Io.Dir.cwd().access(
         b.graph.io,
         "test/linebreak/linebreak_cases.zig",
         .{},

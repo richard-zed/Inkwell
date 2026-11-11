@@ -3509,6 +3509,11 @@ pub const Cache = struct {
     /// itself.
     const class_count = 4;
     const class_max = [class_count]usize{ 256, 1024, 4096, std.math.maxInt(usize) };
+    /// Relative claim on the arena. The top class is capped at 16384 rather
+    /// than unbounded: a 144px glyph is ~30k pixels, but weighting it by its
+    /// true size would starve every smaller class to buy room for the one
+    /// working set that is already the least likely to fit.
+    const class_demand = [class_count]usize{ 256, 1024, 4096, 16384 };
     /// Below this there is no room to divide usefully, and the cache behaves as
     /// one pool exactly as it used to -- which keeps a deliberately tiny arena
     /// in a test meaning what it says.
@@ -3596,15 +3601,30 @@ pub const Cache = struct {
             .partitioned = mem.len - arena_at >= partition_min,
         };
         if (c.partitioned) {
-            const each = c.arena_len / class_count;
+            // Split by DEMAND, not evenly. An even split hands the largest
+            // glyphs -- the ones that need the most room -- the same byte
+            // budget as a 12x12 mask, so the big class thrashed first: a 43
+            // character line at 144px measured 363 misses and 19 flushes
+            // against 107 misses and 0 at 64px. Each class is weighted by its
+            // upper bound, capped so one huge mask cannot claim the arena.
+            var weight: [class_count]usize = undefined;
+            var total: usize = 0;
             var k: usize = 0;
             while (k < class_count) : (k += 1) {
-                c.class_at[k] = k * each;
-                c.class_cap[k] = each;
+                weight[k] = class_demand[k];
+                total += weight[k];
             }
-            // The division is not exact; the last class takes the remainder
-            // rather than leaving bytes unreachable.
-            c.class_cap[class_count - 1] = c.arena_len - (class_count - 1) * each;
+            var base: usize = 0;
+            k = 0;
+            while (k < class_count) : (k += 1) {
+                const share = if (k == class_count - 1)
+                    c.arena_len - base
+                else
+                    c.arena_len / total * weight[k];
+                c.class_at[k] = base;
+                c.class_cap[k] = share;
+                base += share;
+            }
         } else {
             c.class_cap[class_count - 1] = c.arena_len;
         }

@@ -3678,7 +3678,6 @@ pub const Cache = struct {
             return .{ .w = s.w, .h = s.h, .x0 = s.x0, .y0 = s.y0, .pixels = self.mem[at..][0 .. @as(usize, s.w) * s.h] };
         }
 
-        self.stats.misses += 1;
         if (!(scale > 0) or font.units_per_em == 0) return .{};
         const ph = phaseOffset(phase);
         const phy = phaseOffset(phase_y);
@@ -3689,7 +3688,11 @@ pub const Cache = struct {
         const box = try font.bitmapBoxPhase(gid, scale, ph, phy);
         const w: u32 = if (box.x1 > box.x0) @intCast(box.x1 - box.x0) else 0;
         const h: u32 = if (box.y1 > box.y0) @intCast(box.y1 - box.y0) else 0;
+        // A blank glyph (a space) has no ink, so it is not a cache miss and
+        // must not be stored: a w==h==0 entry never satisfies a later lookup.
         if (w == 0 or h == 0) return .{ .x0 = box.x0, .y0 = box.y0 };
+
+        self.stats.misses += 1;
         const len = @as(usize, w) * h;
 
         const cls = self.classOf(len);
@@ -7877,4 +7880,22 @@ test "ink bounds handle a run of off-curve points" {
     try std.testing.expectEqual(@as(i32, 150), b.x1);
     try std.testing.expectEqual(@as(i32, 0), b.y0);
     try std.testing.expectEqual(@as(i32, 100), b.y1);
+}
+
+test "a blank glyph is neither stored nor counted as a miss" {
+    var mem: [Cache.needed(.{})]u8 align(8) = undefined;
+    var fbuf: [4096]u8 = undefined;
+    const font = try Font.init(buildTestFont(&fbuf, false));
+    var cache = try Cache.init(&mem, .{});
+
+    // ' ' has no outline, so it has no mask. Asking twice must not count a
+    // miss either time: there is nothing to miss, and storing a w==h==0
+    // entry would leave every later lookup missing on it forever.
+    const space = try font.glyphIndex(' ');
+    const a = try cache.maskAt(&font, space, 0.2, .zero);
+    const b = try cache.maskAt(&font, space, 0.2, .zero);
+    try std.testing.expectEqual(@as(u32, 0), a.w);
+    try std.testing.expectEqual(@as(u32, 0), b.w);
+    try std.testing.expectEqual(@as(u64, 0), cache.stats.misses);
+    try std.testing.expectEqual(@as(u64, 0), cache.stats.hits);
 }

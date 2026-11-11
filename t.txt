@@ -1,0 +1,15 @@
+test
++- run test w
+
+linebreak: 19300/19346 cases = 99.76%
+linebreak: boundaries 41371/41439 = 99.84%
+failed command: ./.zig-cache/o/a8ab16ecb34a74c3d25a84d34a641738/test --cache-dir=./.zig-cache --seed=0xe984f729 --listen=-
+
+Build Summary: 5/5 steps succeeded; 157/157 tests passed
+test success
++- run test 156 pass (156 total) 314ms MaxRSS:5M
+|  +- compile test debug native success 10s MaxRSS:429M
++- run test 1 pass (1 total) 54ms MaxRSS:4M
+   +- compile test debug native success 8s MaxRSS:370M
+
+EXIT=0
